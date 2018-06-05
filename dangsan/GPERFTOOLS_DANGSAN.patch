@@ -1,0 +1,1058 @@
+diff --git a/Makefile.am b/Makefile.am
+index b5f4725..210ecbe 100755
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -9,14 +9,15 @@ ACLOCAL_AMFLAGS = -I m4
+ AUTOMAKE_OPTIONS = subdir-objects
+ 
+ # This is so we can #include <gperftools/foo>
+-AM_CPPFLAGS = -I$(top_srcdir)/src
++METAPAGETABLEDIR=$(top_srcdir)/../metapagetable/obj
++AM_CPPFLAGS = -I$(top_srcdir)/src -I$(METAPAGETABLEDIR)
+ 
+ if !WITH_STACK_TRACE
+ AM_CPPFLAGS += -DNO_TCMALLOC_SAMPLES
+ endif !WITH_STACK_TRACE
+ 
+ # This is mostly based on configure options
+-AM_CXXFLAGS =
++AM_CXXFLAGS = -I$(METAPAGETABLEDIR)
+ 
+ NO_BUILTIN_CXXFLAGS =
+ 
+@@ -492,7 +493,8 @@ libtcmalloc_minimal_la_CXXFLAGS = -DNO_TCMALLOC_SAMPLES \
+                                   $(PTHREAD_CFLAGS) -DNDEBUG $(AM_CXXFLAGS)
+ # -version-info gets passed to libtool
+ libtcmalloc_minimal_la_LDFLAGS = -version-info @TCMALLOC_SO_VERSION@ $(AM_LDFLAGS)
+-libtcmalloc_minimal_la_LIBADD = libtcmalloc_minimal_internal.la
++libtcmalloc_minimal_la_LIBADD = libtcmalloc_minimal_internal.la $(METAPAGETABLEDIR)/libmetapagetable.la
++EXTRA_libtcmalloc_minimal_la_DEPENDENCIES = $(METAPAGETABLEDIR)/libmetapagetable.la
+ 
+ # For windows, we're playing around with trying to do some stacktrace
+ # support even with libtcmalloc_minimal.  For everyone else, though,
+@@ -910,7 +912,8 @@ lib_LTLIBRARIES += libtcmalloc.la
+ libtcmalloc_la_SOURCES = $(TCMALLOC_CC) $(TCMALLOC_INCLUDES)
+ libtcmalloc_la_CXXFLAGS = $(PTHREAD_CFLAGS) -DNDEBUG $(AM_CXXFLAGS)
+ libtcmalloc_la_LDFLAGS = $(PTHREAD_CFLAGS) -version-info @TCMALLOC_SO_VERSION@
+-libtcmalloc_la_LIBADD = libtcmalloc_internal.la libmaybe_threads.la $(PTHREAD_LIBS)
++libtcmalloc_la_LIBADD = libtcmalloc_internal.la libmaybe_threads.la $(PTHREAD_LIBS) $(METAPAGETABLEDIR)/libmetapagetable.la
++EXTRA_libtcmalloc_la_DEPENDENCIES = $(METAPAGETABLEDIR)/libmetapagetable.la
+ 
+ if WITH_HEAP_CHECKER
+ # heap-checker-bcad is last, in hopes its global ctor will run first.
+diff --git a/src/central_freelist.cc b/src/central_freelist.cc
+index 11b190d..ea321d6 100644
+--- a/src/central_freelist.cc
++++ b/src/central_freelist.cc
+@@ -38,6 +38,7 @@
+ #include "linked_list.h"       // for SLL_Next, SLL_Push, etc
+ #include "page_heap.h"         // for PageHeap
+ #include "static_vars.h"       // for Static
++#include <metapagetable.h>
+ 
+ using std::min;
+ using std::max;
+@@ -139,6 +140,14 @@ void CentralFreeList::ReleaseToSpans(void* object) {
+     lock_.Unlock();
+     {
+       SpinLockHolder h(Static::pageheap_lock());
++
++      if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++          unsigned long metaentry = get_metapagetable_entry((void*)(span->start << kPageShift));
++          set_metapagetable_entries((void*)(span->start << kPageShift), span->length << kPageShift, 0, 0);
++          Span* metaspan = MapObjectToSpan((void*)(metaentry >> 8));
++          Static::pageheap()->Delete(metaspan);
++      }
++
+       Static::pageheap()->Delete(span);
+     }
+     lock_.Lock();
+@@ -327,7 +336,24 @@ void CentralFreeList::Populate() {
+   {
+     SpinLockHolder h(Static::pageheap_lock());
+     span = Static::pageheap()->New(npages);
+-    if (span) Static::pageheap()->RegisterSizeClass(span, size_class_);
++    if (span) {
++      Static::pageheap()->RegisterSizeClass(span, size_class_);
++
++      // Meta-pagetable might not be initialized yet.
++      page_table_init();
++      if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++          int alignment = std::min<int>(AlignmentBitsForSize(Static::sizemap()->ByteSizeForClass(size_class_)), kPageShift);
++          int rounding_offset = (1 << alignment) - 1;
++          Span* metaspan = Static::pageheap()->New((span->length * FLAGS_METALLOC_METADATABYTES + rounding_offset) >> alignment);
++          if (metaspan != NULL) {  
++            set_metapagetable_entries((void*)(span->start << kPageShift), span->length << kPageShift, 
++                  (void*)(metaspan->start << kPageShift), alignment);
++          } else {
++            Static::pageheap()->Delete(span);
++            span = NULL;
++          }
++      }
++    }
+   }
+   if (span == NULL) {
+     Log(kLog, __FILE__, __LINE__,
+diff --git a/src/common.cc b/src/common.cc
+index 2cf507e..fa2e106 100644
+--- a/src/common.cc
++++ b/src/common.cc
+@@ -37,6 +37,7 @@
+ #include "system-alloc.h"
+ #include "base/spinlock.h"
+ #include "getenv_safe.h" // TCMallocGetenvSafe
++#include <metapagetable.h>
+ 
+ namespace tcmalloc {
+ 
+@@ -96,6 +97,16 @@ int AlignmentForSize(size_t size) {
+   return alignment;
+ }
+ 
++int AlignmentBitsForSize(size_t size) {
++  if (size > kMaxSize) {
++    // Cap alignment at kPageSize for large sizes.
++    return __builtin_ctzll(kPageSize);
++  } else {
++    // Return number of trailing 0-bits as alignment
++    return __builtin_ctzll(size);
++  }
++}
++
+ int SizeMap::NumMoveSize(size_t size) {
+   if (size == 0) return 0;
+   // Use approx 64k transfers between thread and central caches.
+@@ -185,6 +196,9 @@ void SizeMap::Init() {
+     for (int s = next_size; s <= max_size_in_class; s += kAlignment) {
+       class_array_[ClassIndex(s)] = c;
+     }
++    if (class_to_pages_[c] < 32) {
++        class_to_pages_[c] = 32;
++    }
+     next_size = max_size_in_class + kAlignment;
+   }
+ 
+diff --git a/src/common.h b/src/common.h
+index 15d7ee7..16ffbc7 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -156,6 +156,7 @@ inline Length pages(size_t bytes) {
+ // For larger allocation sizes, we use larger memory alignments to
+ // reduce the number of size classes.
+ int AlignmentForSize(size_t size);
++int AlignmentBitsForSize(size_t size);
+ 
+ // Size-class information + mapping
+ class SizeMap {
+diff --git a/src/malloc_hook_mmap_linux.h b/src/malloc_hook_mmap_linux.h
+index 0f531db..55d671a 100755
+--- a/src/malloc_hook_mmap_linux.h
++++ b/src/malloc_hook_mmap_linux.h
+@@ -45,6 +45,12 @@
+ #include <sys/mman.h>
+ #include <errno.h>
+ #include "base/linux_syscall_support.h"
++#include <metapagetable.h>
++
++__attribute__ ((weak)) void set_metapagetable_entries(void *ptr, unsigned long size, void *metaptr, int alignment) {
++/* prevent unit tests from failing to link */
++}
++
+ 
+ // The x86-32 case and the x86-64 case differ:
+ // 32b has a mmap2() syscall, 64b does not.
+@@ -121,6 +127,7 @@ static inline void* do_mmap64(void *start, size_t length,
+ 
+ #endif  // #if defined(__x86_64__)
+ 
++void *metalloc_sentinel = 0;
+ 
+ #ifdef MALLOC_HOOK_HAVE_DO_MMAP64
+ 
+@@ -161,6 +168,13 @@ extern "C" void* mmap64(void *start, size_t length, int prot, int flags,
+     result = do_mmap64(start, length, prot, flags, fd, offset);
+   }
+   MallocHook::InvokeMmapHook(result, start, length, prot, flags, fd, offset);
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    if (metalloc_sentinel == 0) {
++        metalloc_sentinel = do_mmap64(0, METALLOC_PAGESIZE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    }
++    unsigned long rounded_length = (((length + METALLOC_PAGESIZE - 1) / METALLOC_PAGESIZE) * METALLOC_PAGESIZE);
++    set_metapagetable_entries(result, rounded_length, metalloc_sentinel, 63);
++  }
+   return result;
+ }
+ 
+@@ -176,6 +190,13 @@ extern "C" void* mmap(void *start, size_t length, int prot, int flags,
+                        static_cast<size_t>(offset)); // avoid sign extension
+   }
+   MallocHook::InvokeMmapHook(result, start, length, prot, flags, fd, offset);
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    if (metalloc_sentinel == 0) {
++        metalloc_sentinel = do_mmap64(0, METALLOC_PAGESIZE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    }
++    unsigned long rounded_length = (((length + METALLOC_PAGESIZE - 1) / METALLOC_PAGESIZE) * METALLOC_PAGESIZE);
++    set_metapagetable_entries(result, rounded_length, metalloc_sentinel, 63);
++  }
+   return result;
+ }
+ 
+@@ -187,6 +208,10 @@ extern "C" int munmap(void* start, size_t length) __THROW {
+   if (!MallocHook::InvokeMunmapReplacement(start, length, &result)) {
+     result = sys_munmap(start, length);
+   }
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    unsigned long rounded_length = (((length + METALLOC_PAGESIZE - 1) / METALLOC_PAGESIZE) * METALLOC_PAGESIZE);
++    set_metapagetable_entries(start, rounded_length, 0, 0);
++  }
+   return result;
+ }
+ 
+@@ -199,6 +224,17 @@ extern "C" void* mremap(void* old_addr, size_t old_size, size_t new_size,
+   void* result = sys_mremap(old_addr, old_size, new_size, flags, new_address);
+   MallocHook::InvokeMremapHook(result, old_addr, old_size, new_size, flags,
+                                new_address);
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    set_metapagetable_entries(old_addr, old_size, 0, 0);
++    if (metalloc_sentinel == 0) {
++        metalloc_sentinel = do_mmap64(0, METALLOC_PAGESIZE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    }
++    unsigned long rounded_length;
++    rounded_length = (((old_size + METALLOC_PAGESIZE - 1) / METALLOC_PAGESIZE) * METALLOC_PAGESIZE);
++    set_metapagetable_entries(old_addr, rounded_length, 0, 0);
++    rounded_length = (((new_size + METALLOC_PAGESIZE - 1) / METALLOC_PAGESIZE) * METALLOC_PAGESIZE);
++    set_metapagetable_entries(result, rounded_length, metalloc_sentinel, 63);
++  }
+   return result;
+ }
+ 
+@@ -210,6 +246,13 @@ extern "C" void* sbrk(ptrdiff_t increment) __THROW {
+   MallocHook::InvokePreSbrkHook(increment);
+   void *result = __sbrk(increment);
+   MallocHook::InvokeSbrkHook(result, increment);
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    if (metalloc_sentinel == 0) {
++        metalloc_sentinel = do_mmap64(0, METALLOC_PAGESIZE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    }
++    unsigned long rounded_length = (((increment + METALLOC_PAGESIZE - 1) / METALLOC_PAGESIZE) * METALLOC_PAGESIZE);
++    set_metapagetable_entries(result, rounded_length, metalloc_sentinel, 63);
++  }
+   return result;
+ }
+ 
+diff --git a/src/metadata_page_heap.cc b/src/metadata_page_heap.cc
+new file mode 100644
+index 0000000..55b1900
+--- /dev/null
++++ b/src/metadata_page_heap.cc
+@@ -0,0 +1,180 @@
++// -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
++// Copyright (c) 2008, Google Inc.
++// All rights reserved.
++//
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are
++// met:
++//
++//     * Redistributions of source code must retain the above copyright
++// notice, this list of conditions and the following disclaimer.
++//     * Redistributions in binary form must reproduce the above
++// copyright notice, this list of conditions and the following disclaimer
++// in the documentation and/or other materials provided with the
++// distribution.
++//     * Neither the name of Google Inc. nor the names of its
++// contributors may be used to endorse or promote products derived from
++// this software without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++// ---
++// Author: Sanjay Ghemawat <opensource@google.com>
++
++#include <config.h>
++#ifdef HAVE_INTTYPES_H
++#include <inttypes.h>                   // for PRIuPTR
++#endif
++#include <errno.h>                      // for ENOMEM, errno
++#include <gperftools/malloc_extension.h>      // for MallocRange, etc
++#include "base/basictypes.h"
++#include "base/commandlineflags.h"
++#include "internal_logging.h"  // for ASSERT, TCMalloc_Printer, etc
++#include "page_heap_allocator.h"  // for PageHeapAllocator
++#include "static_vars.h"       // for Static
++#include "system-alloc.h"      // for TCMalloc_SystemAlloc, etc
++
++namespace tcmalloc {
++
++static const size_t kForcedCoalesceInterval = 128*1024*1024;
++
++Span* MetadataPageHeap::New(Length n, size_t ac) {
++  ASSERT(n > 0);
++  if (n > (METADATAOFFSET >> kPageShift)) {
++    Log(kCrash, __FILE__, __LINE__,
++        "tcmalloc-metadata: requested allocation too large", n, METADATAOFFSET >> kPageShift);
++  } 
++
++  Span* result = list_[ac].SearchFreeAndLargeLists(n);
++  if (result != NULL) return result;
++
++  PageHeap::Stats lStats = list_[ac].stats();
++
++  if (lStats.free_bytes != 0 && lStats.unmapped_bytes != 0
++      && lStats.free_bytes + lStats.unmapped_bytes >= lStats.system_bytes / 4
++      && (lStats.system_bytes / kForcedCoalesceInterval
++          != (lStats.system_bytes + (n << kPageShift)) / kForcedCoalesceInterval)) {
++    // We're about to grow heap, but there are lots of free pages.
++    // tcmalloc's design decision to keep unmapped and free spans
++    // separately and never coalesce them means that sometimes there
++    // can be free pages span of sufficient size, but it consists of
++    // "segments" of different type so page heap search cannot find
++    // it. In order to prevent growing heap and wasting memory in such
++    // case we're going to unmap all free pages. So that all free
++    // spans are maximally coalesced.
++    //
++    // We're also limiting 'rate' of going into this path to be at
++    // most once per 128 megs of heap growth. Otherwise programs that
++    // grow heap frequently (and that means by small amount) could be
++    // penalized with higher count of minor page faults.
++    //
++    // See also large_heap_fragmentation_unittest.cc and
++    // https://code.google.com/p/gperftools/issues/detail?id=368
++    list_[ac].ReleaseAtLeastNPages(static_cast<Length>(0x7fffffff));
++
++    // then try again. If we are forced to grow heap because of large
++    // spans fragmentation and not because of problem described above,
++    // then at the very least we've just unmapped free but
++    // insufficiently big large spans back to OS. So in case of really
++    // unlucky memory fragmentation we'll be consuming virtual address
++    // space, but not real memory
++    result = list_[ac].SearchFreeAndLargeLists(n);
++    if (result != NULL) return result;
++  }
++
++  // Grow the heap and try again.
++  if (!list_[ac].GrowHeap(ARENASIZE >> kPageShift)) {
++    // underlying SysAllocator likely set ENOMEM but we can get here
++    // due to EnsureLimit so we set it here too.
++    //
++    // Setting errno to ENOMEM here allows us to avoid dealing with it
++    // in fast-path.
++    errno = ENOMEM;
++    return NULL;
++  }
++  return list_[ac].SearchFreeAndLargeLists(n);
++}
++
++void MetadataPageHeap::Delete(Span* span) {
++  size_t ac = span->alignmentclass;
++  list_[ac].Delete(span);
++}
++
++void MetadataPageHeap::RegisterSizeClass(Span* span, size_t ac, size_t sc) {
++  list_[ac].RegisterSizeClass(span, sc);
++  span->alignmentclass = ac;
++}
++
++static void RecordGrowth(size_t growth) {
++  StackTrace* t = Static::stacktrace_allocator()->New();
++  t->depth = GetStackTrace(t->stack, kMaxStackDepth-1, 3);
++  t->size = growth;
++  t->stack[kMaxStackDepth-1] = reinterpret_cast<void*>(Static::growth_stacks());
++  Static::set_growth_stacks(t);
++}
++
++bool CoarsePageHeap::GrowHeap(Length n) {
++  ASSERT(n == (ARENASIZE >> kPageShift));
++  Length available_data_pages = (n / 2);
++  // Bug in tcmalloc allows for 8-byte alignment for really small objects
++  if (ac_ == 0)
++    available_data_pages--;
++  void* ptr = NULL;
++  size_t actual_size;
++  ptr = TCMalloc_SystemAlloc(n << kPageShift, &actual_size, ARENASIZE);
++  if (ptr == NULL || actual_size != (n << kPageShift)) {
++    Log(kLog, __FILE__, __LINE__,
++        "tcmalloc-metadata: allocation of arena failed", n);
++    return false;
++  }
++  RecordGrowth(available_data_pages << kPageShift);
++
++  // Store metadata at the end of the arena
++  size_t *end_ptr = ((size_t*)ptr) + (ARENASIZE / sizeof(size_t));
++  *(end_ptr - 1) = Static::sizemap()->AlignmentBitsForAlignment(ac_) - 3;
++
++  uint64_t old_system_bytes = stats_.system_bytes;
++  stats_.system_bytes += (available_data_pages << kPageShift);
++  stats_.committed_bytes += (available_data_pages << kPageShift);
++  const PageID p = reinterpret_cast<uintptr_t>(ptr) >> kPageShift;
++  ASSERT(p > 0);
++
++  // If we have already a lot of pages allocated, just pre allocate a bunch of
++  // memory for the page map. This prevents fragmentation by pagemap metadata
++  // when a program keeps allocating and freeing large blocks.
++
++  /*if (old_system_bytes < kPageMapBigAllocationThreshold
++      && stats_.system_bytes >= kPageMapBigAllocationThreshold) {
++    pagemap_.PreallocateMoreMemory();
++  }*/
++
++  // Make sure pagemap_ has entries for all of the new pages.
++  // Plus ensure one before and one after so coalescing code
++  // does not need bounds-checking.
++  if (pagemap_.Ensure(p-1, available_data_pages +2)) {
++    // Pretend the new area is allocated and then Delete() it to cause
++    // any necessary coalescing to occur.
++    Span* span = NewSpan(p, available_data_pages);
++    RecordSpan(span);
++    Delete(span);
++    ASSERT(stats_.unmapped_bytes+ stats_.committed_bytes==stats_.system_bytes);
++    ASSERT(Check());
++    return true;
++  } else {
++    // We could not allocate memory within "pagemap_"
++    // TODO: Once we can return memory to the system, return the new span
++    return false;
++  }
++}
++
++}  // namespace tcmalloc
+diff --git a/src/metadata_page_heap.h b/src/metadata_page_heap.h
+new file mode 100644
+index 0000000..7c8590f
+--- /dev/null
++++ b/src/metadata_page_heap.h
+@@ -0,0 +1,218 @@
++// -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
++// Copyright (c) 2008, Google Inc.
++// All rights reserved.
++//
++// Redistribution and use in source and binary forms, with or without
++// modification, are permitted provided that the following conditions are
++// met:
++//
++//     * Redistributions of source code must retain the above copyright
++// notice, this list of conditions and the following disclaimer.
++//     * Redistributions in binary form must reproduce the above
++// copyright notice, this list of conditions and the following disclaimer
++// in the documentation and/or other materials provided with the
++// distribution.
++//     * Neither the name of Google Inc. nor the names of its
++// contributors may be used to endorse or promote products derived from
++// this software without specific prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++// ---
++// Author: Sanjay Ghemawat <opensource@google.com>
++
++#ifndef TCMALLOC_METADATA_PAGE_HEAP_H_
++#define TCMALLOC_METADATA_PAGE_HEAP_H_
++
++#include <config.h>
++#include <stddef.h>                     // for size_t
++#ifdef HAVE_STDINT_H
++#include <stdint.h>                     // for uint64_t, int64_t, uint16_t
++#endif
++#include <gperftools/malloc_extension.h>
++#include "base/basictypes.h"
++#include "common.h"
++#include "packed-cache-inl.h"
++#include "pagemap.h"
++#include "span.h"
++
++// We need to dllexport PageHeap just for the unittest.  MSVC complains
++// that we don't dllexport the PageHeap members, but we don't need to
++// test those, so I just suppress this warning.
++#ifdef _MSC_VER
++#pragma warning(push)
++#pragma warning(disable:4251)
++#endif
++
++// This #ifdef should almost never be set.  Set NO_TCMALLOC_SAMPLES if
++// you're porting to a system where you really can't get a stacktrace.
++// Because we control the definition of GetStackTrace, all clients of
++// GetStackTrace should #include us rather than stacktrace.h.
++#ifdef NO_TCMALLOC_SAMPLES
++  // We use #define so code compiles even if you #include stacktrace.h somehow.
++# define GetStackTrace(stack, depth, skip)  (0)
++#else
++# include <gperftools/stacktrace.h>
++#endif
++
++namespace tcmalloc {
++
++// -------------------------------------------------------------------------
++// Page-level allocator which groups allocations based on size-class and
++// allows for metadata
++//  * Eager coalescing
++//
++// Collection of heap for page-level allocation. Redirects to the
++// indivudual PageHeap responsible for each size-class.
++// -------------------------------------------------------------------------
++
++class PERFTOOLS_DLL_DECL CoarsePageHeap : public PageHeap {
++  size_t ac_;
++ public:
++  bool GrowHeap(Length n);
++  void SetAlignmentClass(size_t ac) { ac_ = ac; }
++};
++
++// -------------------------------------------------------------------------
++// Page-level allocator which groups allocations based on size-class and
++// allows for metadata
++//  * Eager coalescing
++//
++// Collection of heap for page-level allocation. Redirects to the
++// indivudual PageHeap responsible for each size-class.
++// -------------------------------------------------------------------------
++
++class PERFTOOLS_DLL_DECL MetadataPageHeap {
++ public:
++  MetadataPageHeap() : aggressive_decommit_(false) {
++    for (int i = 0; i < kNumAlignmentClasses; ++i) {
++      list_[i].SetAlignmentClass(i);
++    }
++  }
++
++  // Allocate a run of "n" pages.  Returns zero if out of memory.
++  // Caller should not pass "n == 0" -- instead, n should have
++  // been rounded up already.
++  Span* New(Length n, size_t ac);
++
++  // Delete the span "[p, p+n-1]".
++  // REQUIRES: span was returned by earlier call to New() and
++  //           has not yet been deleted.
++  void Delete(Span* span);
++
++  // Mark an allocated span as being used for small objects of the
++  // specified size-class.
++  // REQUIRES: span was returned by an earlier call to New()
++  //           and has not yet been deleted.
++  void RegisterSizeClass(Span* span, size_t ac, size_t sc);
++
++  // Split an allocated span into two spans: one of length "n" pages
++  // followed by another span of length "span->length - n" pages.
++  // Modifies "*span" to point to the first span of length "n" pages.
++  // Returns a pointer to the second span.
++  //
++  // REQUIRES: "0 < n < span->length"
++  // REQUIRES: span->location == IN_USE
++  // REQUIRES: span->sizeclass == 0
++  Span* Split(Span* span, Length n) { return list_[0].Split(span, n); }
++
++  // Return the descriptor for the specified page.  Returns NULL if
++  // this PageID was not allocated previously.
++  inline Span* GetDescriptor(PageID p) const {
++    Span *result;
++    for (int i = 0; i < kNumAlignmentClasses; ++i) {
++      result = reinterpret_cast<Span*>(list_[i].GetDescriptor(p));
++      if (result != NULL)
++        return result;
++    }
++    return NULL;
++  }
++
++  // If this page heap is managing a range with starting page # >= start,
++  // store info about the range in *r and return true.  Else return false.
++  bool GetNextRange(PageID start, base::MallocRange* r) {
++    return list_[0].GetNextRange(start, r);
++  }
++
++  inline PageHeap::Stats stats() const { return list_[0].stats(); }
++
++  void GetSmallSpanStats(PageHeap::SmallSpanStats* result) {
++    return list_[0].GetSmallSpanStats(result);
++  }
++
++  void GetLargeSpanStats(PageHeap::LargeSpanStats* result) {
++    return list_[0].GetLargeSpanStats(result);
++  }
++
++  bool Check() { return list_[0].Check(); }
++  // Like Check() but does some more comprehensive checking.
++  bool CheckExpensive() { return list_[0].CheckExpensive(); }
++  bool CheckList(Span* list, Length min_pages, Length max_pages,
++                 int freelist) {  // ON_NORMAL_FREELIST or ON_RETURNED_FREELIST
++    return list_[0].CheckList(list, min_pages, max_pages, freelist);
++  }
++
++  // Try to release at least num_pages for reuse by the OS.  Returns
++  // the actual number of pages released, which may be less than
++  // num_pages if there weren't enough pages to release. The result
++  // may also be larger than num_pages since page_heap might decide to
++  // release one large range instead of fragmenting it into two
++  // smaller released and unreleased ranges.
++  Length ReleaseAtLeastNPages(Length num_pages) {
++    Length result = 0;
++    for (int i = 0; i < kNumAlignmentClasses; ++i) {
++      result += list_[i].ReleaseAtLeastNPages(num_pages);
++    }
++    return result;
++  }
++
++  // Return 0 if we have no information, or else the correct sizeclass for p.
++  // Reads and writes to pagemap_cache_ do not require locking.
++  // The entries are 64 bits on 64-bit hardware and 16 bits on
++  // 32-bit hardware, and we don't mind raciness as long as each read of
++  // an entry yields a valid entry, not a partially updated entry.
++  size_t GetSizeClassIfCached(PageID p) const {
++    size_t result;
++    for (int i = 0; i < kNumAlignmentClasses; ++i) {
++      result = list_[i].GetSizeClassIfCached(p);
++      if (result != 0)
++        return result;
++    }
++    return 0;
++  }
++
++  void CacheSizeClass(PageID p, size_t ac, size_t cl) const {
++    list_[ac].CacheSizeClass(p, cl);
++  }
++
++  bool GetAggressiveDecommit(void) {return aggressive_decommit_;}
++  void SetAggressiveDecommit(bool aggressive_decommit) {
++    aggressive_decommit_ = aggressive_decommit;
++    for (int i = 0; i < kNumAlignmentClasses; ++i) {
++      list_[i].SetAggressiveDecommit(aggressive_decommit_);
++    }
++  }
++
++ private:
++  CoarsePageHeap list_[kNumAlignmentClasses];     // Array indexed by size-class
++
++  bool aggressive_decommit_;
++};
++
++}  // namespace tcmalloc
++
++#ifdef _MSC_VER
++#pragma warning(pop)
++#endif
++
++#endif  // TCMALLOC_METADATA_PAGE_HEAP_H_
+diff --git a/src/static_vars.cc b/src/static_vars.cc
+index 79de97e..dfa087d 100644
+--- a/src/static_vars.cc
++++ b/src/static_vars.cc
+@@ -113,10 +113,12 @@ void Static::InitStaticVars() {
+ static inline
+ void SetupAtForkLocksHandler()
+ {
++#if 0
+   perftools_pthread_atfork(
+     CentralCacheLockAll,    // parent calls before fork
+     CentralCacheUnlockAll,  // parent calls after fork
+     CentralCacheUnlockAll); // child calls after fork
++#endif
+ }
+ REGISTER_MODULE_INITIALIZER(tcmalloc_fork_handler, SetupAtForkLocksHandler());
+ 
+diff --git a/src/tcmalloc.cc b/src/tcmalloc.cc
+index 387ba76..98609b1 100644
+--- a/src/tcmalloc.cc
++++ b/src/tcmalloc.cc
+@@ -131,6 +131,7 @@
+ #include "system-alloc.h"      // for DumpSystemAllocatorStats, etc
+ #include "tcmalloc_guard.h"    // for TCMallocGuard
+ #include "thread_cache.h"      // for ThreadCache
++#include <metapagetable.h>
+ 
+ #ifdef __clang__
+ // clang's apparent focus on code size somehow causes it to ignore
+@@ -1140,7 +1141,7 @@ inline bool should_report_large(Length num_pages) {
+ }
+ 
+ // Helper for do_malloc().
+-inline void* do_malloc_pages(ThreadCache* heap, size_t size) {
++inline void* do_malloc_pages(ThreadCache* heap, size_t &size) {
+   void* result;
+   bool report_large;
+ 
+@@ -1155,6 +1156,22 @@ inline void* do_malloc_pages(ThreadCache* heap, size_t size) {
+   } else {
+     SpinLockHolder h(Static::pageheap_lock());
+     Span* span = Static::pageheap()->New(num_pages);
++
++    if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++        if (span != NULL) {
++          int alignment = kPageShift;
++          int rounding_offset = (1 << alignment) - 1;
++          Span* metaspan = Static::pageheap()->New((span->length * FLAGS_METALLOC_METADATABYTES  + rounding_offset) >> alignment);
++          if (metaspan != 0) {
++            set_metapagetable_entries((void*)(span->start << kPageShift), span->length << kPageShift, 
++                (void*)(metaspan->start << kPageShift), alignment);
++          } else {
++            Static::pageheap()->Delete(span);
++            span = NULL;
++          }
++        }
++    }
++
+     result = (UNLIKELY(span == NULL) ? NULL : SpanToMallocResult(span));
+     report_large = should_report_large(num_pages);
+   }
+@@ -1165,9 +1182,26 @@ inline void* do_malloc_pages(ThreadCache* heap, size_t size) {
+   return result;
+ }
+ 
+-ALWAYS_INLINE void* do_malloc_small(ThreadCache* heap, size_t size) {
++ALWAYS_INLINE void* do_malloc_small(ThreadCache* heap, size_t &size) {
++  ASSERT(Static::IsInited());
++  ASSERT(heap != NULL);
++
++  size_t cl = Static::sizemap()->SizeClass(size);
++  size = Static::sizemap()->class_to_size(cl);
++
++  if (UNLIKELY(FLAGS_tcmalloc_sample_parameter > 0) && heap->SampleAllocation(size)) {
++    return DoSampledAllocation(size);
++  } else {
++    // The common case, and also the simplest.  This just pops the
++    // size-appropriate freelist, after replenishing it if it's empty.
++    return CheckedMallocResult(heap->Allocate(size, cl));
++  }
++}
++
++ALWAYS_INLINE void* do_malloc_metadata(ThreadCache* heap, size_t size) {
+   ASSERT(Static::IsInited());
+   ASSERT(heap != NULL);
++
+   size_t cl = Static::sizemap()->SizeClass(size);
+   size = Static::sizemap()->class_to_size(cl);
+ 
+@@ -1180,15 +1214,49 @@ ALWAYS_INLINE void* do_malloc_small(ThreadCache* heap, size_t size) {
+   }
+ }
+ 
++static ALWAYS_INLINE void* reset_metadata(ThreadCache* heap, void *ptr, unsigned long content_size, unsigned long allocation_size) {
++  unsigned long *deepmetadata = NULL;
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    if (FLAGS_METALLOC_DEEPMETADATA) {
++      deepmetadata = (unsigned long*)do_malloc_metadata(heap, FLAGS_METALLOC_DEEPMETADATABYTES);
++    }
++  }
++  METALLOC_ALLOC_HOOK(ptr, deepmetadata, content_size, allocation_size);
++
++  if (metalloc_malloc_posthook)
++	metalloc_malloc_posthook((unsigned long)ptr, allocation_size);
++	 
++  return ptr;
++}
++
++static ALWAYS_INLINE void* get_deepmetadata_ptr(void *ptr) {
++  unsigned long page = (unsigned long)ptr / METALLOC_PAGESIZE;
++  unsigned long entry = pageTable[page];
++  unsigned long alignment = entry & 0xFF;
++  char *metabase = (char*)(entry >> 8);
++  char *metaptr = metabase + ((((unsigned long)ptr - (page * METALLOC_PAGESIZE)) >> alignment) * sizeof(unsigned long));
++  return (void*)(*(unsigned long*)metaptr);
++}
++
+ ALWAYS_INLINE void* do_malloc(size_t size) {
++  ThreadCache* heap;
++  void *result;
++  size_t content_size = size;
++#ifdef METALLOC_ALLOC_SIZE_HOOK
++  size = METALLOC_ALLOC_SIZE_HOOK(content_size);
++#endif
+   if (ThreadCache::have_tls &&
+       LIKELY(size < ThreadCache::MinSizeForSlowPath())) {
+-    return do_malloc_small(ThreadCache::GetCacheWhichMustBePresent(), size);
++    heap = ThreadCache::GetCacheWhichMustBePresent();
++    result = do_malloc_small(heap, size);
+   } else if (size <= kMaxSize) {
+-    return do_malloc_small(ThreadCache::GetCache(), size);
++    heap = ThreadCache::GetCache();
++    result = do_malloc_small(heap, size);
+   } else {
+-    return do_malloc_pages(ThreadCache::GetCache(), size);
++    heap = ThreadCache::GetCache();
++    result = do_malloc_pages(heap, size);
+   }
++  return reset_metadata(heap, result, content_size, size);
+ }
+ 
+ static void *retry_malloc(void* size) {
+@@ -1224,6 +1292,38 @@ inline void free_null_or_invalid(void* ptr, void (*invalid_free_fn)(void*)) {
+   }
+ }
+ 
++ALWAYS_INLINE void do_free_metadata(void* ptr,
++                                    void (*invalid_free_fn)(void*),
++                                    ThreadCache* heap,
++                                    bool heap_must_be_valid) {
++  Span* span = NULL;
++  const PageID p = reinterpret_cast<uintptr_t>(ptr) >> kPageShift;
++  size_t cl = Static::pageheap()->GetSizeClassIfCached(p);
++  if (UNLIKELY(cl == 0)) {
++    span = Static::pageheap()->GetDescriptor(p);
++    if (UNLIKELY(!span)) {
++      // span can be NULL because the pointer passed in is NULL or invalid
++      // (not something returned by malloc or friends), or because the
++      // pointer was allocated with some other allocator besides
++      // tcmalloc.  The latter can happen if tcmalloc is linked in via
++      // a dynamic library, but is not listed last on the link line.
++      // In that case, libraries after it on the link line will
++      // allocate with libc malloc, but free with tcmalloc's free.
++      free_null_or_invalid(ptr, invalid_free_fn);
++      return;
++    }
++    cl = span->sizeclass;
++  }
++  if (heap_must_be_valid || heap != NULL) {
++    heap->Deallocate(ptr, cl);
++  } else {
++    // Delete directly into central cache
++    tcmalloc::SLL_SetNext(ptr, NULL);
++    Static::central_cache()[cl].InsertRange(ptr, ptr, 1);
++  }
++  return;
++}
++
+ // Helper for do_free_with_callback(), below.  Inputs:
+ //   ptr is object to be freed
+ //   invalid_free_fn is a function that gets invoked on certain "bad frees"
+@@ -1271,6 +1371,29 @@ ALWAYS_INLINE void do_free_helper(void* ptr,
+     Static::pageheap()->CacheSizeClass(p, cl);
+   }
+   ASSERT(ptr != NULL);
++
++  /* Metaalloc free prehook */
++  if (metalloc_free_prehook) {
++	metalloc_free_prehook((unsigned long)ptr, Static::sizemap()->class_to_size(cl));
++        //METALLOC_ALLOC_HOOK(ptr, 0, 0, Static::sizemap()->class_to_size(cl));
++  }
++
++  if (FLAGS_METALLOC_DEEPMETADATA && !FLAGS_METALLOC_FIXEDCOMPRESSION) {
++    do_free_metadata(get_deepmetadata_ptr(ptr), invalid_free_fn, heap, heap_must_be_valid);
++    /* TODO: DangSan - Set metadata ptr to NULL.
++     * perlbench has a bug. 1) Allocates memory and deepmetadata ptr
++     * 2) Memory is freed but dangling pointer hand around. 
++     * 3) Deepmetaptr gets allocated for the other object.
++     * 4) Dangling pointer is copied to another pointer. Thus, dang_registerptr()
++     * is called which registers pointer with the incorrect object.
++     * 5) Now store new memory object into the dangling pointer.
++     * TODO: This may reduce the performance.
++     */
++    METALLOC_ALLOC_HOOK(ptr, 0, 0, Static::sizemap()->class_to_size(cl));
++  }
++#ifdef METALLOC_FREE_HOOK
++  METALLOC_FREE_HOOK(ptr, Static::sizemap()->class_to_size(cl));
++#endif
+   if (LIKELY(cl != 0)) {
+     ASSERT(!Static::pageheap()->GetDescriptor(p)->sample);
+     if (heap_must_be_valid || heap != NULL) {
+@@ -1290,6 +1413,15 @@ ALWAYS_INLINE void do_free_helper(void* ptr,
+       Static::stacktrace_allocator()->Delete(st);
+       span->objects = NULL;
+     }
++
++    if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++        unsigned long metaentry = get_metapagetable_entry((void*)(span->start << kPageShift));
++        set_metapagetable_entries((void*)(span->start << kPageShift), span->length << kPageShift, 0, 0);
++        const PageID metapage = (metaentry >> 8) >> kPageShift;
++        Span* metaspan = Static::pageheap()->GetDescriptor(metapage);
++        Static::pageheap()->Delete(metaspan);
++    }
++
+     Static::pageheap()->Delete(span);
+   }
+ }
+@@ -1346,6 +1478,11 @@ ALWAYS_INLINE void* do_realloc_with_callback(
+     void* old_ptr, size_t new_size,
+     void (*invalid_free_fn)(void*),
+     size_t (*invalid_get_size_fn)(const void*)) {
++  size_t content_size = new_size;
++#ifdef METALLOC_ALLOC_SIZE_HOOK
++  new_size = METALLOC_ALLOC_SIZE_HOOK(content_size);
++#endif
++
+   // Get the size of the old entry
+   const size_t old_size = GetSizeWithCallback(old_ptr, invalid_get_size_fn);
+ 
+@@ -1366,13 +1503,13 @@ ALWAYS_INLINE void* do_realloc_with_callback(
+     }
+     if (new_ptr == NULL) {
+       // Either new_size is not a tiny increment, or last do_malloc failed.
+-      new_ptr = do_malloc_or_cpp_alloc(new_size);
++      new_ptr = do_malloc_or_cpp_alloc(content_size);
+     }
+     if (UNLIKELY(new_ptr == NULL)) {
+       return NULL;
+     }
+     MallocHook::InvokeNewHook(new_ptr, new_size);
+-    memcpy(new_ptr, old_ptr, ((old_size < new_size) ? old_size : new_size));
++    memcpy(new_ptr, old_ptr, ((old_size < content_size) ? old_size : content_size));
+     MallocHook::InvokeDeleteHook(old_ptr);
+     // We could use a variant of do_free() that leverages the fact
+     // that we already know the sizeclass of old_ptr.  The benefit
+@@ -1380,6 +1517,9 @@ ALWAYS_INLINE void* do_realloc_with_callback(
+     do_free_with_callback(old_ptr, invalid_free_fn);
+     return new_ptr;
+   } else {
++#ifdef METALLOC_RESIZE_HOOK
++  new_size = METALLOC_RESIZE_HOOK(ptr, content_size, old_size);
++#endif
+     // We still need to call hooks to report the updated size:
+     MallocHook::InvokeDeleteHook(old_ptr);
+     MallocHook::InvokeNewHook(old_ptr, new_size);
+@@ -1402,11 +1542,16 @@ ALWAYS_INLINE void* do_realloc(void* old_ptr, size_t new_size) {
+ void* do_memalign(size_t align, size_t size) {
+   ASSERT((align & (align - 1)) == 0);
+   ASSERT(align > 0);
++  size_t content_size = size;
++#ifdef METALLOC_ALLOC_SIZE_HOOK
++  size = METALLOC_ALLOC_SIZE_HOOK(content_size);
++#endif
++
+   if (size + align < size) return NULL;         // Overflow
+ 
+   // Fall back to malloc if we would already align this memory access properly.
+   if (align <= AlignmentForSize(size)) {
+-    void* p = do_malloc(size);
++    void* p = do_malloc(content_size);
+     ASSERT((reinterpret_cast<uintptr_t>(p) % align) == 0);
+     return p;
+   }
+@@ -1431,7 +1576,7 @@ void* do_memalign(size_t align, size_t size) {
+     if (cl < kNumClasses) {
+       ThreadCache* heap = ThreadCache::GetCache();
+       size = Static::sizemap()->class_to_size(cl);
+-      return CheckedMallocResult(heap->Allocate(size, cl));
++      return reset_metadata(heap, CheckedMallocResult(heap->Allocate(size, cl)), content_size, size);
+     }
+   }
+ 
+@@ -1443,6 +1588,24 @@ void* do_memalign(size_t align, size_t size) {
+     // TODO: We could put the rest of this page in the appropriate
+     // TODO: cache but it does not seem worth it.
+     Span* span = Static::pageheap()->New(tcmalloc::pages(size));
++
++    if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++        if (span != NULL) {
++          int alignment = kPageShift;
++          int rounding_offset = (1 << alignment) - 1;
++          Span* metaspan = Static::pageheap()->New((span->length * FLAGS_METALLOC_METADATABYTES  + rounding_offset) >> alignment);
++          if (metaspan != 0) {
++            set_metapagetable_entries((void*)(span->start << kPageShift), span->length << kPageShift, 
++                (void*)(metaspan->start << kPageShift), alignment);
++            ThreadCache* heap = ThreadCache::GetCache();
++            reset_metadata(heap, (void*)(span->start << kPageShift), content_size, span->length << kPageShift);
++          } else {
++            Static::pageheap()->Delete(span);
++            span = NULL;
++          }
++        }
++    }
++
+     return UNLIKELY(span == NULL) ? NULL : SpanToMallocResult(span);
+   }
+ 
+@@ -1470,6 +1633,24 @@ void* do_memalign(size_t align, size_t size) {
+     Span* trailer = Static::pageheap()->Split(span, needed);
+     Static::pageheap()->Delete(trailer);
+   }
++
++  if (!FLAGS_METALLOC_FIXEDCOMPRESSION) {
++      if (span != NULL) {
++        int alignment = kPageShift;
++        int rounding_offset = (1 << alignment) - 1;
++        Span* metaspan = Static::pageheap()->New((span->length * FLAGS_METALLOC_METADATABYTES  + rounding_offset) >> alignment);
++        if (metaspan != 0) {
++          set_metapagetable_entries((void*)(span->start << kPageShift), span->length << kPageShift, 
++             (void*)(metaspan->start << kPageShift), alignment);
++          ThreadCache* heap = ThreadCache::GetCache();
++          reset_metadata(heap, (void*)(span->start << kPageShift), content_size, span->length << kPageShift);
++        } else {
++          Static::pageheap()->Delete(span); 
++          span = NULL;
++        }
++      }
++  }
++
+   return SpanToMallocResult(span);
+ }
+ 
+@@ -1537,6 +1718,10 @@ void TCMallocImplementation::MarkThreadBusy() {
+   do_free(do_malloc(0));
+ }
+ 
++__thread void *tcmalloc_stackptr;
++
++#define STORE_STACKPTR() do { tcmalloc_stackptr = __builtin_frame_address(0); } while (0)
++
+ //-------------------------------------------------------------------
+ // Exported routines
+ //-------------------------------------------------------------------
+@@ -1574,6 +1759,7 @@ extern "C" PERFTOOLS_DLL_DECL void* tc_malloc(size_t size) __THROW {
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void tc_free(void* ptr) __THROW {
++  STORE_STACKPTR();
+   MallocHook::InvokeDeleteHook(ptr);
+   do_free(ptr);
+ }
+@@ -1586,12 +1772,14 @@ extern "C" PERFTOOLS_DLL_DECL void* tc_calloc(size_t n,
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void tc_cfree(void* ptr) __THROW {
++  STORE_STACKPTR();
+   MallocHook::InvokeDeleteHook(ptr);
+   do_free(ptr);
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void* tc_realloc(void* old_ptr,
+                                                size_t new_size) __THROW {
++  STORE_STACKPTR();
+   if (old_ptr == NULL) {
+     void* result = do_malloc_or_cpp_alloc(new_size);
+     MallocHook::InvokeNewHook(result, new_size);
+@@ -1623,6 +1811,7 @@ extern "C" PERFTOOLS_DLL_DECL void* tc_new_nothrow(size_t size, const std::nothr
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void tc_delete(void* p) __THROW {
++  STORE_STACKPTR();
+   MallocHook::InvokeDeleteHook(p);
+   do_free(p);
+ }
+@@ -1631,6 +1820,7 @@ extern "C" PERFTOOLS_DLL_DECL void tc_delete(void* p) __THROW {
+ // (via ::operator delete(ptr, nothrow)).
+ // But it's really the same as normal delete, so we just do the same thing.
+ extern "C" PERFTOOLS_DLL_DECL void tc_delete_nothrow(void* p, const std::nothrow_t&) __THROW {
++  STORE_STACKPTR();
+   MallocHook::InvokeDeleteHook(p);
+   do_free(p);
+ }
+@@ -1654,11 +1844,13 @@ extern "C" PERFTOOLS_DLL_DECL void* tc_newarray_nothrow(size_t size, const std::
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void tc_deletearray(void* p) __THROW {
++  STORE_STACKPTR();
+   MallocHook::InvokeDeleteHook(p);
+   do_free(p);
+ }
+ 
+ extern "C" PERFTOOLS_DLL_DECL void tc_deletearray_nothrow(void* p, const std::nothrow_t&) __THROW {
++  STORE_STACKPTR();
+   MallocHook::InvokeDeleteHook(p);
+   do_free(p);
+ }

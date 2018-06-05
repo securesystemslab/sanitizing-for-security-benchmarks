@@ -1,0 +1,1950 @@
+diff --git a/lib/CMakeLists.txt b/lib/CMakeLists.txt
+index 4ab1e93..b35a153 100644
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -4,6 +4,8 @@
+ include(AddCompilerRT)
+ include(SanitizerUtils)
+ 
++add_subdirectory(lowfat)
++
+ # Hoist the building of sanitizer_common on whether we're building either the
+ # sanitizers or xray (or both).
+ #
+diff --git a/lib/lowfat/CMakeLists.txt.legacy b/lib/lowfat/CMakeLists.txt.legacy
+new file mode 100644
+index 0000000..49f500c
+--- /dev/null
++++ b/lib/lowfat/CMakeLists.txt.legacy
+@@ -0,0 +1,20 @@
++add_compiler_rt_component(lowfat)
++
++set(LOWFAT_SOURCES
++  lowfat.c)
++
++include_directories(..)
++
++set(LOWFAT_CFLAGS -std=gnu99 -m64 -mno-bmi -mno-bmi2 -mno-lzcnt -I. -O2 -mcmodel=large)
++
++add_compiler_rt_runtime(clang_rt.lowfat
++        STATIC
++        ARCHS x86_64 
++        SOURCES ${LOWFAT_SOURCES}
++        CFLAGS ${LOWFAT_CFLAGS}
++        PARENT_TARGET lowfat)
++
++add_sanitizer_rt_symbols(clang_rt.lowfat)
++
++add_dependencies(compiler-rt lowfat)
++
+diff --git a/lib/lowfat/CMakeLists.txt.modern b/lib/lowfat/CMakeLists.txt.modern
+new file mode 100644
+index 0000000..b04fed1
+--- /dev/null
++++ b/lib/lowfat/CMakeLists.txt.modern
+@@ -0,0 +1,20 @@
++add_compiler_rt_component(lowfat)
++
++set(LOWFAT_SOURCES
++  lowfat.c)
++
++include_directories(..)
++
++set(LOWFAT_CFLAGS -std=gnu99 -m64 -I. -O2 -mbmi -mbmi2 -mlzcnt -mcmodel=large)
++
++add_compiler_rt_runtime(clang_rt.lowfat
++        STATIC
++        ARCHS x86_64 
++        SOURCES ${LOWFAT_SOURCES}
++        CFLAGS ${LOWFAT_CFLAGS}
++        PARENT_TARGET lowfat)
++
++add_sanitizer_rt_symbols(clang_rt.lowfat)
++
++add_dependencies(compiler-rt lowfat)
++
+diff --git a/lib/lowfat/lowfat.c b/lib/lowfat/lowfat.c
+new file mode 100644
+index 0000000..8e91767
+--- /dev/null
++++ b/lib/lowfat/lowfat.c
+@@ -0,0 +1,658 @@
++/*
++ *   _|                                      _|_|_|_|            _|
++ *   _|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|
++ *   _|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|
++ *   _|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|
++ *   _|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|
++ * 
++ * Gregory J. Duck.
++ *
++ * Copyright (c) 2017 The National University of Singapore.
++ * All rights reserved.
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See the LICENSE file for details.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include <signal.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <dlfcn.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#ifndef F_SETLEASE
++#define F_SETLEASE              1024
++#endif
++
++#define LOWFAT_PAGE_SIZE        4096
++#define LOWFAT_MAX_ADDRESS      0x1000000000000ull
++
++#define LOWFAT_CONSTRUCTOR      __attribute__((__constructor__(10102)))
++#define LOWFAT_DESTRUCTOR       __attribute__((__destructor__(10102)))
++#define LOWFAT_NOINLINE         __attribute__((__noinline__))
++#define LOWFAT_NORETURN         __attribute__((__noreturn__))
++#define LOWFAT_CONST            __attribute__((__const__))
++#define LOWFAT_ALIAS(name)      __attribute__((__alias__(name)))
++#define LOWFAT_DATA             /* EMPTY */
++#define LOWFAT_CPUID(a, c, ax, bx, cx, dx)                                  \
++    __asm__ __volatile__ ("cpuid" : "=a" (ax), "=b" (bx), "=c" (cx),        \
++        "=d" (dx) : "a" (a), "c" (c))
++
++#define LOWFAT_SIZES            _LOWFAT_SIZES
++#define LOWFAT_MAGICS           _LOWFAT_MAGICS
++
++static LOWFAT_NOINLINE void lowfat_rand(void *buf, size_t len);
++static int lowfat_create_shm(size_t size);
++static LOWFAT_CONST void *lowfat_region(size_t idx);
++extern LOWFAT_CONST void *lowfat_stack_mirror(void *ptr, size_t idx);
++extern LOWFAT_NOINLINE void lowfat_stack_pivot(void);
++static LOWFAT_NOINLINE LOWFAT_NORETURN void lowfat_error(
++    const char *format, ...);
++static LOWFAT_NOINLINE void lowfat_warning(const char *format, ...);
++
++#include "lowfat_config.c"
++#include "lowfat.h"
++
++static LOWFAT_DATA uint8_t *lowfat_seed = NULL;
++static LOWFAT_DATA size_t lowfat_seed_pos = LOWFAT_PAGE_SIZE;
++
++#ifndef LOWFAT_DATA_ONLY
++#include "lowfat_threads.c"
++#include "lowfat_malloc.c"
++#include "lowfat_memops.c"
++#ifndef LOWFAT_NO_MEMORY_ALIAS
++#include "lowfat_fork.c"
++#endif
++#endif
++
++static LOWFAT_DATA lowfat_mutex_t lowfat_print_mutex;
++static LOWFAT_DATA size_t lowfat_num_messages = 0;
++static LOWFAT_DATA bool lowfat_malloc_inited = false;
++
++extern size_t lowfat_get_num_errors(void)
++{
++    return lowfat_num_messages;
++}
++
++/*
++ * CSPRNG
++ */
++static LOWFAT_NOINLINE void lowfat_rand(void *buf0, size_t len)
++{
++    uint8_t *buf = (uint8_t *)buf0;
++    while (len > 0)
++    {
++        if (lowfat_seed_pos >= LOWFAT_PAGE_SIZE)
++        {
++            const char *path = "/dev/urandom";
++            int fd = open(path, O_RDONLY);
++            if (fd < 0)
++                lowfat_error("failed to open \"%s\": %s", path,
++                    strerror(errno));
++            ssize_t r = read(fd, lowfat_seed, LOWFAT_PAGE_SIZE);
++            if (r < 0)
++                lowfat_error("failed to read \"%s\": %s", path,
++                    strerror(errno));
++            if (r != LOWFAT_PAGE_SIZE)
++                lowfat_error("failed to read %zu bytes from \"%s\"",
++                    LOWFAT_PAGE_SIZE, path);
++            if (close(fd) < 0)
++                lowfat_error("failed to close \"%s\": %s", path,
++                    strerror(errno));
++            lowfat_seed_pos = 0;
++        }
++        *buf = lowfat_seed[lowfat_seed_pos];
++        lowfat_seed[lowfat_seed_pos] = 0;
++        lowfat_seed_pos++;
++        len--;
++        buf++;
++    }
++}
++
++extern LOWFAT_NOINLINE const char *lowfat_color_escape_code(FILE *stream,
++    bool red)
++{
++    // Simply assumes ANSI compatible terminal rather than create ncurses
++    // dependency.  Who still uses non-ANSI terminals anyway?
++    int err = errno;
++    int r = isatty(fileno(stream));
++    errno = err;
++    if (!r)
++        return "";
++    else
++        return (red? "\33[31m": "\33[0m");
++}
++
++/*
++ * Print the lowfat banner.
++ */
++static LOWFAT_NOINLINE void lowfat_print_banner(void)
++{
++    fprintf(stderr, "%s"
++        "_|                                      _|_|_|_|            _|\n"
++        "_|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|\n"
++        "_|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|\n"
++        "_|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|\n"
++        "_|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|%s\n"
++        "\n",
++        lowfat_color_escape_code(stderr, true),
++        lowfat_color_escape_code(stderr, false));
++}
++
++/*
++ * Print an error or warning.
++ */
++#include <execinfo.h>
++static LOWFAT_NOINLINE void lowfat_message(const char *format, bool err,
++    va_list ap)
++{
++    lowfat_mutex_lock(&lowfat_print_mutex);
++
++    // (1) Print the error:
++    lowfat_print_banner();
++    fprintf(stderr, "%sLOWFAT %s%s: ",
++        lowfat_color_escape_code(stderr, true),
++        (err? "ERROR": "WARNING"),
++        lowfat_color_escape_code(stderr, false));
++    vfprintf(stderr, format, ap);
++    fputc('\n', stderr);
++
++    // (2) Dump the stack:
++    if (lowfat_malloc_inited)
++    {
++        size_t MAX_TRACE = 256;
++        void *trace[MAX_TRACE];
++        int len = backtrace(trace, sizeof(trace) / sizeof(void *));
++        char **trace_strs = backtrace_symbols(trace, len);
++        for (int i = 0; i < len; i++)
++            fprintf(stderr, "%d: %s\n", i, trace_strs[i]);
++        if (len == 0 || len == sizeof(trace) / sizeof(void *))
++            fprintf(stderr, "...\n");
++    }
++
++    lowfat_num_messages++;
++    lowfat_mutex_unlock(&lowfat_print_mutex);
++}
++
++/*
++ * Print an error and exit.
++ */
++static LOWFAT_NOINLINE LOWFAT_NORETURN void lowfat_error(
++    const char *format, ...)
++{
++    va_list ap;
++    va_start(ap, format);
++    lowfat_message(format, /*err=*/true, ap);
++    va_end(ap);
++    abort();
++}
++
++/*
++ * Print a warning.
++ */
++static LOWFAT_NOINLINE void lowfat_warning(const char *format, ...)
++{
++    va_list ap;
++    va_start(ap, format);
++    lowfat_message(format, /*err=*/false, ap);
++    va_end(ap);
++}
++
++/*
++ * Open a unique+anonymous shared memory object.
++ */
++static int lowfat_create_shm(size_t size)
++{
++    char path[] =
++        "/dev/shm/lowfat.XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX.tmp";
++    for (size_t i = 0; i < sizeof(path)-2; i++)
++    {
++        if (path[i] != 'X' || path[i+1] != 'X')
++            continue;
++        const char *xdigs = "0123456789ABCDEF";
++        uint8_t rbyte;
++        lowfat_rand(&rbyte, sizeof(rbyte));
++        path[i++] = xdigs[rbyte & 0x0F];
++        path[i]   = xdigs[(rbyte >> 4) & 0x0F];
++    }
++    int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0);
++    if (fd < 0)
++        lowfat_error("failed to open \"%s\": %s", path, strerror(errno));
++    if (unlink(path) < 0)
++        lowfat_error("failed to unlink \"%s\": %s", path, strerror(errno));
++    // The following call will fail if:
++    // (1) fd is not "the" unique file descriptor to `path'; or
++    // (2) a hardlink to `path' exists.
++    if (fcntl(fd, F_SETLEASE, F_WRLCK) < 0)
++        lowfat_error("failed to lease \"%s\": %s", path, strerror(errno));
++    if (ftruncate(fd, size) < 0)
++        lowfat_error("failed to truncate \"%s\": %s\n", path, strerror(errno));
++    return fd;
++}
++
++/*
++ * Get pointer kind as a string.
++ */
++static LOWFAT_NOINLINE const char *lowfat_kind(const void *ptr)
++{
++    if (!lowfat_is_ptr(ptr))
++        return "nonfat";
++    if (lowfat_is_heap_ptr(ptr))
++        return "heap";
++    if (lowfat_is_stack_ptr(ptr))
++        return "stack";
++    if (lowfat_is_global_ptr(ptr))
++        return "global";
++    return "unused";
++}
++
++/*
++ * LOWFAT SEGV handler.
++ */
++static LOWFAT_NORETURN void lowfat_segv_handler(int sig, siginfo_t *info,
++    void *context0)
++{
++    void *ptr = info->si_addr;
++    lowfat_error("caught deadly SEGV signal\n"
++        "\tpointer = %p (%s)\n"
++        "\tbase    = %p\n"
++        "\tsize    = %zu",
++        ptr, lowfat_kind(ptr), lowfat_base(ptr), lowfat_size(ptr));
++}
++
++/*
++ * Setup the LOWFAT environment.
++ */
++void LOWFAT_CONSTRUCTOR lowfat_init(void)
++{
++    static bool lowfat_inited = false;
++    if (lowfat_inited)
++        return;
++    lowfat_inited = true;
++
++    lowfat_mutex_init(&lowfat_print_mutex);
++
++    // Basic sanity checks:
++    if (sizeof(void *) != sizeof(uint64_t))
++        lowfat_error("incompatible architecture (not x86-64)");
++    if (sysconf(_SC_PAGESIZE) != LOWFAT_PAGE_SIZE)
++        lowfat_error("incompatible system page size (expected %u; got %ld)",
++            LOWFAT_PAGE_SIZE, sysconf(_SC_PAGESIZE));
++#ifndef LOWFAT_LEGACY
++    uint32_t eax, ebx, ecx, edx;
++    LOWFAT_CPUID(7, 0, eax, ebx, ecx, edx);
++    if (((ebx >> 3) & 1) == 0 || ((ebx >> 8) & 1) == 0)
++        lowfat_error("incompatible architecture (no BMI/BMI2 support)");
++#endif
++ 
++    // Random seed memory:
++    lowfat_seed = (uint8_t *)mmap(NULL, LOWFAT_PAGE_SIZE,
++        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (lowfat_seed == MAP_FAILED)
++        lowfat_error("failed to allocate random seed: %s", strerror(errno));
++
++    // Init LOWFAT_SIZES and LOWFAT_MAGICS
++    {
++        // Create LOWFAT_SIZES:
++        size_t total_pages = (LOWFAT_MAX_ADDRESS / LOWFAT_REGION_SIZE) /
++            (LOWFAT_PAGE_SIZE / sizeof(size_t));
++        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED;
++        int prot = PROT_READ | PROT_WRITE;
++        size_t len = LOWFAT_SIZES_PAGES * LOWFAT_PAGE_SIZE;
++        void *ptr = mmap((void *)LOWFAT_SIZES, len, prot, flags, -1, 0);
++        if (ptr != (void *)LOWFAT_SIZES)
++        {
++            mmap_error:
++            lowfat_error("failed to mmap memory: %s", strerror(errno));
++        }
++        int fd = lowfat_create_shm(LOWFAT_PAGE_SIZE);
++        void *start = (uint8_t *)LOWFAT_SIZES + len;
++        void *end = (uint8_t *)LOWFAT_SIZES + total_pages * LOWFAT_PAGE_SIZE;
++        while (start < end)
++        {
++            flags = MAP_SHARED | MAP_NORESERVE | MAP_FIXED;
++            ptr = mmap(start, LOWFAT_PAGE_SIZE, prot, flags, fd, 0);
++            if (ptr != start)
++                goto mmap_error;
++            start = (uint8_t *)start + LOWFAT_PAGE_SIZE;
++            prot = PROT_READ;
++        }
++        if (close(fd) < 0)
++        {
++            close_error:
++            lowfat_error("failed to close object: %s", strerror(errno));
++        }
++
++        // Create LOWFAT_MAGICS:
++        flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED;
++        prot = PROT_READ | PROT_WRITE;
++        ptr = mmap((void *)LOWFAT_MAGICS, len, prot, flags, -1, 0);
++        if (ptr != (void *)LOWFAT_MAGICS)
++            goto mmap_error;
++        prot = PROT_READ;
++        len = (total_pages - LOWFAT_SIZES_PAGES) * LOWFAT_PAGE_SIZE;
++        start = (uint8_t *)LOWFAT_MAGICS +
++            LOWFAT_SIZES_PAGES * LOWFAT_PAGE_SIZE;
++        ptr = mmap(start, len, prot, flags, -1, 0);
++        if (ptr != start)
++            goto mmap_error;
++
++        // Init LOWFAT_SIZES and LOWFAT_MAGICS data:
++        size_t i = 0;
++        LOWFAT_SIZES[i++] = SIZE_MAX;
++        size_t sizes_len = sizeof(lowfat_sizes) / sizeof(lowfat_sizes[0]);
++        for (size_t j = 0; j < sizes_len; j++)
++            LOWFAT_SIZES[i++] = lowfat_sizes[j];
++        while (((uintptr_t)(LOWFAT_SIZES + i) % LOWFAT_PAGE_SIZE) != 0)
++            LOWFAT_SIZES[i++] = SIZE_MAX;
++        for (size_t j = 0; j < LOWFAT_PAGE_SIZE / sizeof(size_t); j++)
++            LOWFAT_SIZES[i++] = SIZE_MAX;
++        i = 0;
++        LOWFAT_MAGICS[i++] = 0;
++        for (size_t j = 0; j < sizes_len; j++)
++            LOWFAT_MAGICS[i++] = lowfat_magics[j];
++        while (((uintptr_t)(LOWFAT_MAGICS + i) % LOWFAT_PAGE_SIZE) != 0)
++            LOWFAT_MAGICS[i++] = 0;
++
++        len = (LOWFAT_SIZES_PAGES + 1) * LOWFAT_PAGE_SIZE;
++        if (mprotect((void *)LOWFAT_SIZES, len, PROT_READ) < 0 ||
++            mprotect((void *)LOWFAT_MAGICS, LOWFAT_SIZES_PAGES *
++                LOWFAT_PAGE_SIZE, PROT_READ) < 0)
++            lowfat_error("failed to write protect memory: %s",
++                strerror(errno));
++    }
++
++#ifndef LOWFAT_DATA_ONLY
++
++    // Init regions for lowfat_malloc()
++    for (size_t i = 1; i <= LOWFAT_NUM_REGIONS; i++)
++    {
++        const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
++            MAP_FIXED;
++        const int prot = PROT_NONE;
++        void *heap_start = (uint8_t *)lowfat_region(i) +
++            LOWFAT_HEAP_MEMORY_OFFSET;
++        void *ptr = mmap(heap_start, LOWFAT_HEAP_MEMORY_SIZE, prot, flags,
++            -1, 0);
++        if (ptr != heap_start)
++            goto mmap_error;
++    }
++
++    // Init regions for the stack
++#ifndef LOWFAT_NO_MEMORY_ALIAS
++    {
++        int fd = lowfat_create_shm(LOWFAT_STACK_MEMORY_SIZE);
++        size_t idx;
++        for (size_t i = 0; (idx = lowfat_stacks[i]) != 0; i++)
++        {
++            int flags = MAP_FIXED | MAP_NORESERVE | MAP_SHARED;
++            const int prot = PROT_NONE;
++            void *stack_start = (uint8_t *)lowfat_region(idx) +
++                LOWFAT_STACK_MEMORY_OFFSET;
++            void *ptr = mmap(stack_start, LOWFAT_STACK_MEMORY_SIZE, prot,
++                flags, fd, 0);
++            if (ptr != stack_start)
++                goto mmap_error;
++        }
++        if (close(fd) < 0)
++            goto close_error;
++    }
++#else
++    size_t idx;
++    for (size_t i = 0; (idx = lowfat_stacks[i]) != 0; i++)
++    {
++        int flags = MAP_FIXED | MAP_NORESERVE | MAP_ANONYMOUS | MAP_PRIVATE;
++        const int prot = PROT_NONE;
++        void *stack_start = (uint8_t *)lowfat_region(idx) +
++            LOWFAT_STACK_MEMORY_OFFSET;
++        void *ptr = mmap(stack_start, LOWFAT_STACK_MEMORY_SIZE, prot, flags,
++            -1, 0);
++        if (ptr != stack_start)
++            goto mmap_error;
++    }
++#endif /* LOWFAT_NO_MEMORY_ALIAS */
++
++    // Initialize malloc()
++    if (!lowfat_malloc_init())
++        lowfat_error("failed to initialize lowfat malloc(): %s",
++            strerror(errno));
++    lowfat_malloc_inited = true;
++
++    // Initialize multi-threading
++    if (!lowfat_threads_init())
++        lowfat_error("failed to initialize lowfat threads: %s",
++            strerror(errno));
++    
++    // Install SEGV handler.
++    stack_t ss;
++    ss.ss_sp = (uint8_t *)LOWFAT_PAGES_BASE((void *)&ss) -
++        10 * LOWFAT_PAGE_SIZE - SIGSTKSZ;
++    ss.ss_size = SIGSTKSZ;
++    ss.ss_flags = 0;
++    if (sigaltstack(&ss, NULL) == -1)
++        lowfat_error("failed to set signal stack: %s", strerror(errno));
++
++    struct sigaction action;
++    memset(&action, 0, sizeof(action));
++    action.sa_sigaction = lowfat_segv_handler;
++    action.sa_flags |= SA_ONSTACK;
++    sigaction(SIGSEGV, &action, NULL);
++
++    // Replace stack with LOWFAT stack.
++    lowfat_stack_pivot();
++
++#endif /* LOWFAT_DATA_ONLY */
++}
++
++extern inline size_t lowfat_index(const void *ptr);
++extern inline size_t lowfat_size(const void *ptr);
++extern inline size_t lowfat_buffer_size(const void *ptr);
++
++static LOWFAT_CONST void *lowfat_region(size_t idx)
++{
++    return (void *)(idx * LOWFAT_REGION_SIZE);
++}
++
++extern LOWFAT_CONST void *lowfat_stack_mirror(void *ptr, size_t idx)
++{
++    return (void *)((uintptr_t)ptr + lowfat_stack_offsets[idx]);
++}
++
++extern LOWFAT_CONST void *lowfat_stack_align(void *ptr, size_t idx)
++{
++    return (void *)((uintptr_t)ptr & lowfat_stack_masks[idx]);
++}
++
++extern LOWFAT_CONST size_t lowfat_stack_allocsize(size_t idx)
++{
++    return lowfat_stack_sizes[idx];
++}
++
++extern LOWFAT_CONST bool lowfat_is_ptr(const void *ptr)
++{
++    size_t idx = lowfat_index(ptr);
++    return (idx - 1) <= LOWFAT_NUM_REGIONS;
++}
++
++extern LOWFAT_CONST bool lowfat_is_stack_ptr(const void *ptr)
++{
++    size_t idx = lowfat_index(ptr);
++    uintptr_t stack_end = (uintptr_t)lowfat_region(idx) +
++        LOWFAT_STACK_MEMORY_OFFSET + LOWFAT_STACK_MEMORY_SIZE;
++    return lowfat_is_ptr(ptr) &&
++        ((stack_end - (uintptr_t)ptr) <= LOWFAT_STACK_MEMORY_SIZE);
++}
++
++extern LOWFAT_CONST bool lowfat_is_global_ptr(const void *ptr)
++{
++    size_t idx = lowfat_index(ptr);
++    uintptr_t global_end = (uintptr_t)lowfat_region(idx) +
++        LOWFAT_GLOBAL_MEMORY_OFFSET + LOWFAT_GLOBAL_MEMORY_SIZE;
++    return lowfat_is_ptr(ptr) &&
++        ((global_end - (uintptr_t)ptr) <= LOWFAT_GLOBAL_MEMORY_SIZE);
++}
++
++extern LOWFAT_CONST bool lowfat_is_heap_ptr(const void *ptr)
++{
++    size_t idx = lowfat_index(ptr);
++    uintptr_t heap_end = (uintptr_t)lowfat_region(idx) +
++        LOWFAT_HEAP_MEMORY_OFFSET + LOWFAT_HEAP_MEMORY_SIZE;
++    return lowfat_is_ptr(ptr) &&
++        ((heap_end - (uintptr_t)ptr) <= LOWFAT_HEAP_MEMORY_SIZE);
++}
++
++static LOWFAT_NOINLINE const char *lowfat_error_kind(unsigned info)
++{
++    switch (info)
++    {
++        case LOWFAT_OOB_ERROR_READ:
++            return "read";
++        case LOWFAT_OOB_ERROR_WRITE:
++            return "write";
++        case LOWFAT_OOB_ERROR_MEMCPY:
++            return "memcpy";
++        case LOWFAT_OOB_ERROR_MEMSET:
++            return "memset";
++        case LOWFAT_OOB_ERROR_ESCAPE_CALL:
++            return "escape (call)";
++        case LOWFAT_OOB_ERROR_ESCAPE_RETURN:
++            return "escape (return)";
++        case LOWFAT_OOB_ERROR_ESCAPE_STORE:
++            return "escape (store)";
++        case LOWFAT_OOB_ERROR_ESCAPE_PTR2INT:
++            return "escape (ptr2int)";
++        case LOWFAT_OOB_ERROR_ESCAPE_INSERT:
++            return "escape (insert)";
++        default:
++            return "unknown";
++    }
++}
++
++extern LOWFAT_NORETURN void lowfat_oob_error(unsigned info,
++    const void *ptr, const void *baseptr)
++{
++    const char *kind = lowfat_error_kind(info);
++    ssize_t overflow = (ssize_t)ptr - (ssize_t)baseptr;
++    if (overflow > 0)
++        overflow -= lowfat_size(baseptr);
++    lowfat_error(
++        "out-of-bounds error detected!\n"
++        "\toperation = %s\n"
++        "\tpointer   = %p (%s)\n"
++        "\tbase      = %p\n"
++        "\tsize      = %zu\n"
++        "\t%s = %+zd\n",
++        kind, ptr, lowfat_kind(ptr), baseptr, lowfat_size(baseptr),
++        (overflow < 0? "underflow": "overflow "), overflow);
++}
++
++extern void lowfat_oob_warning(unsigned info,
++    const void *ptr, const void *baseptr)
++{
++    const char *kind = lowfat_error_kind(info);
++    ssize_t overflow = (ssize_t)ptr - (ssize_t)baseptr;
++    if (overflow > 0)
++        overflow -= lowfat_size(baseptr);
++    lowfat_warning(
++        "out-of-bounds error detected!\n"
++        "\toperation = %s\n"
++        "\tpointer   = %p (%s)\n"
++        "\tbase      = %p\n"
++        "\tsize      = %zu\n"
++        "\t%s = %+zd\n",
++        kind, ptr, lowfat_kind(ptr), baseptr, lowfat_size(baseptr),
++        (overflow < 0? "underflow": "overflow "), overflow);
++}
++
++extern void lowfat_oob_check(unsigned info, const void *ptr, size_t size0,
++    const void *baseptr)
++{
++    size_t size = lowfat_size(baseptr);
++    size_t diff = (size_t)((const uint8_t *)ptr - (const uint8_t *)baseptr);
++    size -= size0;
++    if (diff >= size)
++        lowfat_oob_error(info, ptr, baseptr);
++}
++
++#ifndef LOWFAT_DATA_ONLY
++/*
++ * Perform a "stack pivot"; replacing the stack with the LOWFAT stack.
++ * Unfortunately there is no way in Linux to specify the location of the stack
++ * before the program starts up, hence the need for some hacks.
++ * This code is likely fragile & non-portable.
++ */
++extern LOWFAT_NOINLINE void *lowfat_stack_pivot_2(void *fptr0)
++{
++    uint8_t *fptr = (uint8_t *)fptr0 - ((uintptr_t)fptr0 % LOWFAT_PAGE_SIZE);
++    fptr += LOWFAT_PAGE_SIZE;
++
++    // mincore() will fail with ENOMEM for unmapped pages.  We can therefore
++    // linearly scan to the base of the stack.
++    // Note in practice this seems to be 1-3 pages at most if called from a
++    // constructor.
++    unsigned char vec;
++    while (mincore(fptr, LOWFAT_PAGE_SIZE, &vec) == 0)
++        fptr += LOWFAT_PAGE_SIZE;
++    if (errno != ENOMEM)
++        lowfat_error("failed to mincore page: %s", strerror(errno));
++    size_t size = fptr - (uint8_t *)fptr0;
++    uint8_t *stack_base = (uint8_t *)lowfat_stack_alloc();
++    if (stack_base == NULL)
++        lowfat_error("failed to allocate stack: %s", strerror(errno));
++    stack_base += LOWFAT_STACK_SIZE;
++    memcpy(stack_base - size, fptr0, size);
++
++    // In some cases the old stack value may be stored on the stack itself,
++    // and restored later.  To fix this we search for and replace old
++    // stack pointers stored on the the stack itself.  There is a small
++    // chance that we may patch an unrelated value.
++    void *old_stack_lo = fptr0, *old_stack_hi = fptr;
++    void **new_stack_lo = (void **)(stack_base - size),
++         **new_stack_hi = (void **)stack_base;
++    for (void **pptr = new_stack_lo; pptr < new_stack_hi; pptr++)
++    {
++        void *ptr = *pptr;
++        if (ptr >= old_stack_lo && ptr <= old_stack_hi)
++        {
++            ssize_t diff = ((uint8_t *)ptr - (uint8_t *)old_stack_lo);
++            void *new_ptr = (uint8_t *)new_stack_lo + diff;
++            // fprintf(stderr, "patch [%p -> %p]\n", ptr, new_ptr);
++            *pptr = new_ptr;
++        }
++    }
++
++    return stack_base - size;
++}
++
++__asm__ (
++    "\t.align 16, 0x90\n"
++    "\t.type lowfat_stack_pivot,@function\n"
++    "lowfat_stack_pivot:\n"
++    "\tmovq %rsp, %rdi\n"
++    "\tmovabsq $lowfat_stack_pivot_2, %rax\n"
++    "\tcallq *%rax\n"
++    "\tmovq %rax, %rsp\n"
++    "\tretq\n"
++);
++
++/*
++ * This bit of magic ensures lowfat_init() is called very early in process
++ * startup.  Using the "constructor" attribute is not good enough since shared
++ * object constructors/initializers may be called before lowfat_init().
++ */
++__attribute__((section(".preinit_array"), used))
++void (*__local_effective_preinit)(void) = lowfat_init;
++
++#endif
++
+diff --git a/lib/lowfat/lowfat.h b/lib/lowfat/lowfat.h
+new file mode 100644
+index 0000000..3de926b
+--- /dev/null
++++ b/lib/lowfat/lowfat.h
+@@ -0,0 +1,223 @@
++/*
++ *   _|                                      _|_|_|_|            _|
++ *   _|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|
++ *   _|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|
++ *   _|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|
++ *   _|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|
++ * 
++ * Gregory J. Duck.
++ *
++ * Copyright (c) 2017 The National University of Singapore.
++ * All rights reserved.
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See the LICENSE file for details.
++ */
++
++#ifndef __LOWFAT_H
++#define __LOWFAT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++
++#ifdef __cplusplus 
++extern "C"
++{
++#endif
++
++#define _LOWFAT_CONST      __attribute__((__const__))
++#define _LOWFAT_NORETURN   __attribute__((__noreturn__))
++#define _LOWFAT_MALLOC     __attribute__((__malloc__))
++#define _LOWFAT_INLINE     __attribute__((__always_inline__))
++
++#define LOWFAT_OOB_ERROR_READ               0
++#define LOWFAT_OOB_ERROR_WRITE              1
++#define LOWFAT_OOB_ERROR_MEMCPY             2
++#define LOWFAT_OOB_ERROR_MEMSET             3
++#define LOWFAT_OOB_ERROR_STRDUP             4
++#define LOWFAT_OOB_ERROR_ESCAPE_CALL        5
++#define LOWFAT_OOB_ERROR_ESCAPE_RETURN      6
++#define LOWFAT_OOB_ERROR_ESCAPE_STORE       7
++#define LOWFAT_OOB_ERROR_ESCAPE_PTR2INT     8
++#define LOWFAT_OOB_ERROR_ESCAPE_INSERT      9
++#define LOWFAT_OOB_ERROR_UNKNOWN            0xFF
++
++#include <lowfat_config.h>
++
++/*
++ * Tests if the given pointer is low-fat or not.
++ */
++extern _LOWFAT_CONST bool lowfat_is_ptr(const void *_ptr);
++
++/*
++ * Tests if the given pointer is a low-fat heap pointer or not.
++ */
++extern _LOWFAT_CONST bool lowfat_is_heap_ptr(const void *_ptr);
++
++/*
++ * Tests if the given pointer is a low-fat stack pointer or not.
++ */
++extern _LOWFAT_CONST bool lowfat_is_stack_ptr(const void *_ptr);
++
++/*
++ * Tests if the given pointer is a low-fat global pointer or not.
++ */
++extern _LOWFAT_CONST bool lowfat_is_global_ptr(const void *_ptr);
++
++/*
++ * Return the region index of the given pointer.
++ */
++static inline _LOWFAT_INLINE size_t lowfat_index(const void *_ptr)
++{
++    return (uintptr_t)_ptr / _LOWFAT_REGION_SIZE;
++}
++
++/*
++ * Return the (allocation) size of the object pointed to by `_ptr', measured 
++ * from the object's base address.  If the size is unknown then this function
++ * returns SIZE_MAX.
++ */
++static inline _LOWFAT_CONST _LOWFAT_INLINE size_t lowfat_size(const void *_ptr)
++{
++    size_t _idx = lowfat_index(_ptr);
++    return _LOWFAT_SIZES[_idx];
++}
++
++/*
++ * Return the base-pointer of the object pointed to by `_ptr'.  If the base
++ * pointer is unknown then this functon returns NULL.
++ */
++static inline _LOWFAT_CONST _LOWFAT_INLINE void *lowfat_base(const void *_ptr)
++{
++    size_t _idx = lowfat_index(_ptr);
++#ifndef LOWFAT_IS_POW2
++    unsigned __int128 _tmp = (unsigned __int128)_LOWFAT_MAGICS[_idx] *
++        (unsigned __int128)(uintptr_t)_ptr;
++    size_t _objidx = (size_t)(_tmp >> 64);
++    return (void *)(_objidx * _LOWFAT_SIZES[_idx]);
++#else   /* LOWFAT_IS_POW2 */
++    return (void *)((uintptr_t)_ptr & _LOWFAT_MAGICS[_idx]);
++#endif  /* LOWFAT_IS_POW2 */
++}
++
++/*
++ * Return the low-fat magic number for `_ptr'.
++ */
++static inline _LOWFAT_CONST _LOWFAT_INLINE size_t lowfat_magic(const void *_ptr)
++{
++    size_t _idx = lowfat_index(_ptr);
++    return _LOWFAT_MAGICS[_idx];
++}
++
++/*
++ * Return the (allocation) size of the buffer pointed to by `_ptr', measured
++ * from `_ptr' itself.  If the size is unknown then this function returns
++ * (SIZE_MAX - (uintptr_t)_ptr).
++ */
++static inline _LOWFAT_CONST _LOWFAT_INLINE size_t lowfat_buffer_size(
++    const void *_ptr)
++{
++    return lowfat_size(_ptr) -
++        ((const uint8_t *)(_ptr) - (const uint8_t *)lowfat_base(_ptr));
++}
++
++/*
++ * Report an out-of-bounds memory error and abort execution.
++ */
++extern _LOWFAT_NORETURN void lowfat_oob_error(unsigned _info,
++    const void *_ptr, const void *_baseptr);
++
++/*
++ * Report an out-of-bounds memory error was a warning only.
++ */
++extern void lowfat_oob_warning(unsigned _info, const void *_ptr,
++    const void *_baseptr);
++
++/*
++ * Check if the given pointer is OOB.  If it is then abort with a call to
++ * lowfat_oob_error().
++ */
++extern void lowfat_oob_check(unsigned _info, const void *_ptr, size_t _size,
++    const void *_baseptr);
++
++/*
++ * Safe replacement malloc().
++ */
++extern _LOWFAT_MALLOC void *lowfat_malloc(size_t _size);
++
++/*
++ * Safe replacement free().
++ */
++extern void lowfat_free(void *_ptr);
++
++/*
++ * Safe replacement realloc().
++ */
++extern void *lowfat_realloc(void *_ptr, size_t _size);
++
++/*
++ * Safe replacement calloc().
++ */
++extern _LOWFAT_MALLOC void *lowfat_calloc(size_t _nmemb, size_t _size);
++
++/*
++ * Safe replacement posix_memalign().
++ */
++extern int lowfat_posix_memalign(void **memptr, size_t align, size_t size);
++
++/*
++ * Safe replacement memalign().
++ */
++extern _LOWFAT_MALLOC void *lowfat_memalign(size_t _align, size_t _size);
++
++/*
++ * Safe replacement aligned_alloc().
++ */
++extern _LOWFAT_MALLOC void *lowfat_aligned_alloc(size_t _align, size_t _size);
++
++/*
++ * Safe replacement valloc().
++ */
++extern _LOWFAT_MALLOC void *lowfat_valloc(size_t _size);
++
++/*
++ * Safe replacment pvalloc().
++ */
++extern _LOWFAT_MALLOC void *lowfat_pvalloc(size_t _size);
++
++/*
++ * Safe replacement strdup().
++ */
++extern _LOWFAT_MALLOC char *lowfat_strdup(const char *_str);
++
++/*
++ * Safe replacement strndup().
++ */
++extern _LOWFAT_MALLOC char *lowfat_strndup(const char *_str, size_t _n);
++
++/*
++ * Safe replacement memset().
++ */
++extern void *lowfat_memset(void *_dst, int _c, size_t _n);
++
++/*
++ * Safe replacement memmove().
++ */
++extern void *lowfat_memmove(void *_dst, const void *_src, size_t _n);
++
++/*
++ * Safe replacement memcpy().
++ */
++extern void *lowfat_memcpy(void *_dst, const void *_src, size_t _n);
++
++/*
++ * Get the number of errors that have been detected so far.
++ */
++extern size_t lowfat_get_num_errors(void);
++
++#ifdef __cplusplus 
++}
++#endif
++
++#endif      /* __LOWFAT_H */
+diff --git a/lib/lowfat/lowfat_fork.c b/lib/lowfat/lowfat_fork.c
+new file mode 100644
+index 0000000..0539e95
+--- /dev/null
++++ b/lib/lowfat/lowfat_fork.c
+@@ -0,0 +1,182 @@
++/*
++ *   _|                                      _|_|_|_|            _|
++ *   _|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|
++ *   _|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|
++ *   _|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|
++ *   _|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|
++ * 
++ * Gregory J. Duck.
++ *
++ * Copyright (c) 2017 The National University of Singapore.
++ * All rights reserved.
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See the LICENSE file for details.
++ */
++
++#include <sched.h>
++#include <setjmp.h>
++#include <signal.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++
++struct lowfat_fork_info
++{
++    pthread_mutex_t mutex;
++    pthread_cond_t condvar;
++    bool done;
++    void *stack;
++    jmp_buf env;
++};
++
++/*
++ * Fork wrapper explicitly copies the call stack for the child process.
++ */
++static int lowfat_fork_child_wrapper(void *arg)
++{
++    struct lowfat_fork_info *info = (struct lowfat_fork_info *)arg;
++
++    // STEP (0): Reset the RNG:
++    lowfat_seed_pos = LOWFAT_PAGE_SIZE;
++
++    // STEP (1): Create a new shared memory object:
++    int fd = lowfat_create_shm(LOWFAT_STACK_MEMORY_SIZE);
++    size_t idx = lowfat_stacks[0];
++    uint8_t *stack_lo = (uint8_t *)lowfat_region(idx) +
++        LOWFAT_STACK_MEMORY_OFFSET;
++    const int prot = PROT_NONE;
++    const int flags = MAP_SHARED | MAP_FIXED | MAP_NORESERVE;
++    void *ptr = mmap(stack_lo, LOWFAT_STACK_MEMORY_SIZE, prot, flags,
++        fd, 0);
++    if (ptr != stack_lo)
++    {
++        pthread_mutex_lock(&info->mutex);
++        info->done = false;
++        pthread_cond_signal(&info->condvar);
++        pthread_mutex_unlock(&info->mutex);
++        mmap_error:
++        lowfat_error("failed to mmap memory: %s", strerror(errno));
++    }
++
++    // STEP (2): Copy the stack memory:
++    uint8_t *copy_lo = (uint8_t *)LOWFAT_PAGES_BASE(info->stack);
++    uint8_t *copy_hi = (uint8_t *)LOWFAT_STACK_BASE(info->stack) +
++        LOWFAT_STACK_SIZE;
++    ptrdiff_t offset = copy_lo - (uint8_t *)LOWFAT_STACKS_START;
++    stack_lo = stack_lo + offset;
++    uint8_t *stack_hi = (uint8_t *)LOWFAT_STACK_BASE(stack_lo) +
++        LOWFAT_STACK_SIZE;
++    uint8_t *prot_lo = stack_hi - LOWFAT_STACK_SIZE + LOWFAT_STACK_GUARD;
++    if (mprotect(prot_lo, stack_hi - prot_lo, PROT_READ | PROT_WRITE) != 0)
++    {
++        pthread_mutex_lock(&info->mutex);
++        info->done = false;
++        pthread_cond_signal(&info->condvar);
++        pthread_mutex_unlock(&info->mutex);
++        mprotect_error:
++        lowfat_error("failed to protect memory: %s", strerror(errno));
++    }
++    memcpy(stack_lo, copy_lo, copy_hi - copy_lo);
++
++    // STEP (2a): Copy is complete; wake up parent.
++    pthread_mutex_lock(&info->mutex);
++    info->done = true;
++    pthread_cond_signal(&info->condvar);
++    pthread_mutex_unlock(&info->mutex);
++
++    // STEP (3): Map the remaining stacks:
++    for (size_t i = 1; (idx = lowfat_stacks[i]) != 0; i++)
++    {
++        uint8_t *stack_lo = (uint8_t *)lowfat_region(idx) +
++            LOWFAT_STACK_MEMORY_OFFSET;
++        const int prot = PROT_NONE;
++        const int flags = MAP_SHARED | MAP_FIXED | MAP_NORESERVE;
++        void *ptr = mmap(stack_lo, LOWFAT_STACK_MEMORY_SIZE, prot, flags,
++            fd, 0);
++        if ((uint8_t *)ptr != stack_lo)
++            goto mmap_error;
++        stack_lo = stack_lo + offset;
++        uint8_t *stack_hi = (uint8_t *)LOWFAT_STACK_BASE(stack_lo) +
++            LOWFAT_STACK_SIZE;
++        uint8_t *prot_lo = stack_hi - LOWFAT_STACK_SIZE + LOWFAT_STACK_GUARD;
++        if (mprotect(prot_lo, stack_hi - prot_lo, PROT_READ | PROT_WRITE) != 0)
++            goto mprotect_error;
++    }
++    if (close(fd) != 0)
++        lowfat_error("failed to close object: %s", strerror(errno));
++
++    // STEP (4): Resume normal execution (in the child):
++    longjmp(info->env, true);
++}
++
++/*
++ * Wraps the fork() (a.k.a. clone()) call to protect the stack for copying.
++ */
++static LOWFAT_NOINLINE pid_t lowfat_fork_wrapper(void *stack_tmp,
++    size_t stack_tmp_size, struct lowfat_fork_info *info)
++{
++    pthread_mutexattr_t mattr;
++    pthread_mutexattr_init(&mattr);
++    pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
++    pthread_mutex_init(&info->mutex, &mattr);
++    pthread_condattr_t cattr;
++    pthread_condattr_init(&cattr);
++    pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
++    pthread_cond_init(&info->condvar, &cattr);
++    info->done = false;
++    info->stack = __builtin_frame_address(0);
++
++    void *stack_tmp_ptr = (uint8_t *)stack_tmp + stack_tmp_size -
++        sizeof(__int128) - sizeof(struct lowfat_fork_info);
++
++    pid_t pid = clone(lowfat_fork_child_wrapper, stack_tmp_ptr, SIGCHLD, info);
++    pthread_mutex_lock(&info->mutex);
++    pthread_cond_wait(&info->condvar, &info->mutex);
++    bool done = info->done;
++    pthread_mutex_unlock(&info->mutex);
++
++    pthread_mutex_destroy(&info->mutex);
++    pthread_mutexattr_destroy(&mattr);
++    pthread_cond_destroy(&info->condvar);
++    pthread_condattr_destroy(&cattr);
++    if (munmap(stack_tmp, stack_tmp_size) != 0)
++        lowfat_error("failed to unmap memory: %s", strerror(errno));
++
++    if (!done)
++    {
++        waitpid(pid, NULL, 0);
++        errno = ECHILD;
++        return -1;
++    }
++    return pid;
++}
++
++/*
++ * LOWFAT fork()
++ */
++extern pid_t fork(void) LOWFAT_ALIAS("lowfat_fork");
++extern pid_t lowfat_fork(void)
++{
++    // STEP (1): Create a temporary stack for the child:
++    const int prot = PROT_READ | PROT_WRITE;
++    const int flags = MAP_SHARED | MAP_NORESERVE | MAP_ANONYMOUS;
++    size_t stack_tmp_size = 4 * LOWFAT_PAGE_SIZE;      // 4 pages
++    void *stack_tmp = mmap(NULL, stack_tmp_size, prot, flags, -1, 0);
++    if (stack_tmp == MAP_FAILED)
++        lowfat_error("failed to allocate new stack: %s", strerror(errno));
++
++    // STEP (2): The child returns here:
++    struct lowfat_fork_info *info =
++        (struct lowfat_fork_info *)((uint8_t *)stack_tmp + stack_tmp_size -
++            sizeof(struct lowfat_fork_info));
++    if (setjmp(info->env))
++    {
++        if (munmap(stack_tmp, stack_tmp_size) != 0)
++            lowfat_error("failed to unmap memory: %s", strerror(errno));
++        return 0;
++    }
++
++    // STEP (3): Clone the current process:
++    return lowfat_fork_wrapper(stack_tmp, stack_tmp_size, info);
++}
++
+diff --git a/lib/lowfat/lowfat_malloc.c b/lib/lowfat/lowfat_malloc.c
+new file mode 100644
+index 0000000..276b176
+--- /dev/null
++++ b/lib/lowfat/lowfat_malloc.c
+@@ -0,0 +1,439 @@
++/*
++ *   _|                                      _|_|_|_|            _|
++ *   _|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|
++ *   _|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|
++ *   _|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|
++ *   _|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|
++ * 
++ * Gregory J. Duck.
++ *
++ * Copyright (c) 2017 The National University of Singapore.
++ * All rights reserved.
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See the LICENSE file for details.
++ */
++
++#define LOWFAT_BIG_OBJECT           (3 * LOWFAT_PAGE_SIZE)
++#define LOWFAT_NUM_PAGES(size)                                          \
++    ((((size) - 1) / LOWFAT_PAGE_SIZE) + 1)
++#define LOWFAT_PAGES_BASE(ptr)                                          \
++    ((void *)((uint8_t *)(ptr) - ((uintptr_t)(ptr) % LOWFAT_PAGE_SIZE)))
++#define LOWFAT_PAGES_SIZE(ptr, size)                                    \
++    (LOWFAT_NUM_PAGES(((uint8_t *)(ptr) -                               \
++        (uint8_t *)LOWFAT_PAGES_BASE(ptr)) + (size)) * LOWFAT_PAGE_SIZE)
++
++extern size_t malloc_usable_size(void *ptr);
++extern void *__libc_malloc(size_t size);
++extern void *__libc_realloc(void *ptr, size_t size);
++extern void __libc_free(void *ptr);
++
++/*
++ * Allocator data-structures.
++ */
++struct lowfat_freelist_s
++{
++    uintptr_t _reserved;    // Reserved for meta-data.
++    struct lowfat_freelist_s *next;
++};
++typedef struct lowfat_freelist_s *lowfat_freelist_t;
++
++struct lowfat_regioninfo_s
++{
++    lowfat_mutex_t mutex;
++    lowfat_freelist_t freelist;
++    void *freeptr;
++    void *endptr;
++    void *accessptr;
++};
++typedef struct lowfat_regioninfo_s *lowfat_regioninfo_t;
++
++LOWFAT_DATA struct lowfat_regioninfo_s LOWFAT_REGION_INFO[LOWFAT_NUM_REGIONS+1];
++
++static void *lowfat_fallback_malloc(size_t size)
++{
++#ifdef LOWFAT_NO_STD_MALLOC_FALLBACK
++    lowfat_error("memory allocation failed: %s", strerror(ENOMEM));
++#else
++    void *ptr = __libc_malloc(size);        // Std malloc().
++    if (ptr == NULL)
++        lowfat_error("memory allocation failed: %s", strerror(errno));
++    return ptr;
++#endif      /* LOWFAT_NO_STD_MALLOC_FALLBACK */
++}
++
++#define lowfat_fallback_free(x)         __libc_free(x)
++#define lowfat_fallback_realloc(x, y)   __libc_realloc((x), (y))
++
++/*
++ * Initialize the lowfat_malloc() state.
++ */
++extern bool lowfat_malloc_init(void)
++{
++    for (size_t i = 0; i < LOWFAT_NUM_REGIONS; i++)
++    {
++        size_t idx = i+1;
++        uint8_t *heapptr = (uint8_t *)lowfat_region(idx) +
++            LOWFAT_HEAP_MEMORY_OFFSET;
++        uint32_t roffset;           // Offset for ASLR
++        lowfat_rand(&roffset, sizeof(roffset));
++        roffset &= LOWFAT_HEAP_ASLR_MASK;
++        uint8_t *startptr =
++            (uint8_t *)lowfat_base(heapptr + roffset + lowfat_size(heapptr) +
++                LOWFAT_PAGE_SIZE);
++        lowfat_regioninfo_t info = LOWFAT_REGION_INFO + idx;
++        if (!lowfat_mutex_init(&info->mutex))
++            return false;
++        info->freelist  = NULL;
++        info->freeptr   = startptr;
++        info->endptr    = heapptr + LOWFAT_HEAP_MEMORY_SIZE;
++        info->accessptr = LOWFAT_PAGES_BASE(startptr);
++    }
++    return true;
++}
++
++/*
++ * LOWFAT malloc()
++ */
++extern void *lowfat_malloc_index(size_t idx, size_t size);
++extern void *lowfat_malloc(size_t size)
++{
++    size_t idx = lowfat_heap_select(size);
++    return lowfat_malloc_index(idx, size);
++}
++extern void *lowfat_malloc_index(size_t idx, size_t size)
++{
++    if (idx == 0)
++    {
++        // We cannot handle the allocation size.
++        // Fallback to stdlib malloc().
++        return lowfat_fallback_malloc(size);
++    }
++    
++    size_t alloc_size = LOWFAT_SIZES[idx];     // Real allocation size.
++
++    lowfat_regioninfo_t info = LOWFAT_REGION_INFO + idx;
++    void *ptr;
++
++    lowfat_mutex_lock(&info->mutex);
++
++    // (1) First, attempt to allocate from the freelist.
++    lowfat_freelist_t freelist = info->freelist;
++    if (freelist != NULL)
++    {
++        info->freelist = freelist->next;
++        lowfat_mutex_unlock(&info->mutex);
++
++        ptr = (void *)freelist;
++
++        // For a free-list object, only the first page of the object is
++        // guaranteed to be accessible.  Make the rest accessible here:
++        if (alloc_size >= LOWFAT_BIG_OBJECT)
++        {
++            uint8_t *prot_ptr = (uint8_t *)LOWFAT_PAGES_BASE(ptr);
++            size_t prot_size = LOWFAT_PAGES_SIZE(ptr, size);
++            mprotect(prot_ptr + LOWFAT_PAGE_SIZE,
++                prot_size - LOWFAT_PAGE_SIZE, PROT_READ | PROT_WRITE);
++
++            // Any remaining pages should be PROT_NONE as enforced by
++            // lowfat_free().  These serve as guard pages.
++        }
++
++        return ptr;
++    }
++
++    // (2) Next, attempt to allocate from fresh space.
++    ptr = info->freeptr;
++    void *freeptr = (uint8_t *)ptr + alloc_size;
++    if (freeptr > info->endptr)
++    {
++        // The region is now full.
++        // Fallback to stdlib malloc().
++        lowfat_mutex_unlock(&info->mutex);
++        return lowfat_fallback_malloc(size);
++    }
++    info->freeptr = freeptr;
++
++    void *accessptr = info->accessptr;
++    if (freeptr > accessptr)
++    {
++        // Ensure that the new space is accessible.
++        uint8_t *prot_ptr = (uint8_t *)LOWFAT_PAGES_BASE(ptr);
++        size_t prot_size = LOWFAT_PAGES_SIZE(ptr, size);
++        if (prot_size < LOWFAT_BIG_OBJECT)
++            prot_size = LOWFAT_BIG_OBJECT;
++        // Syscall while holding the mutex... :(
++        mprotect(prot_ptr, prot_size, PROT_READ | PROT_WRITE);
++        info->accessptr = prot_ptr + prot_size;
++    }
++    
++    lowfat_mutex_unlock(&info->mutex);
++    return ptr;
++}
++
++/*
++ * LOWFAT free()
++ */
++extern void lowfat_free(void *ptr)
++{
++    if (ptr == NULL)    // free(NULL) is a NOP.
++        return;
++    if (!lowfat_is_ptr(ptr))
++    {
++        // If `ptr' is not low-fat, then it is assumed to from a legacy
++        // malloc() allocation.
++        lowfat_fallback_free(ptr);
++        return;
++    }
++    if (!lowfat_is_heap_ptr(ptr))
++    {
++        // Attempt to free a stack or global pointer.
++        const char *kind = (lowfat_is_stack_ptr(ptr)? "stack": "global");
++        lowfat_error(
++            "attempt to free a %s pointer detected!\n"
++            "\tpointer = %p (%s)\n"
++            "\tbase    = %p\n"
++            "\tsize    = %zd\n",
++            kind, ptr, kind, lowfat_base(ptr), lowfat_size(ptr));
++    }
++
++    // It is possible that `ptr' does not point to the object's base (for
++    // memalign() type allocations).
++    ptr = lowfat_base(ptr);
++
++    size_t idx = lowfat_index(ptr);
++    size_t alloc_size = LOWFAT_SIZES[idx];
++    if (alloc_size >= LOWFAT_BIG_OBJECT)
++    {
++        // This is a big object, so return memory to the OS.
++        // The first page is not returned size it is used as the freelist node.
++        uint8_t *prot_ptr = (uint8_t *)LOWFAT_PAGES_BASE(ptr);
++        uint8_t *prot_end_ptr = (uint8_t *)ptr + alloc_size;
++        prot_end_ptr = prot_end_ptr -
++            ((uintptr_t)prot_end_ptr % LOWFAT_PAGE_SIZE);
++        size_t prot_size = prot_end_ptr - prot_ptr;
++
++        madvise(prot_ptr + LOWFAT_PAGE_SIZE, prot_size - LOWFAT_PAGE_SIZE,
++            MADV_DONTNEED);
++        mprotect(prot_ptr + LOWFAT_PAGE_SIZE, prot_size - LOWFAT_PAGE_SIZE,
++            PROT_NONE);
++    }
++
++    lowfat_regioninfo_t info = LOWFAT_REGION_INFO + idx;
++    lowfat_mutex_lock(&info->mutex);
++    lowfat_freelist_t newfreelist = (lowfat_freelist_t)ptr;
++    lowfat_freelist_t oldfreelist = info->freelist;
++    newfreelist->next = oldfreelist;
++    info->freelist = newfreelist;
++    lowfat_mutex_unlock(&info->mutex);
++}
++
++/*
++ * Stdlib malloc() and free() replacements.
++ */
++// free()/realloc() must always be intercepted.  This handles the case where
++// memory is allocated by the main program, but free'ed by an uninstrumented
++// library.
++extern void free(void *ptr) LOWFAT_ALIAS("lowfat_free");
++extern void *realloc(void *ptr, size_t size) LOWFAT_ALIAS("lowfat_realloc");
++#ifndef LOWFAT_NO_REPLACE_STD_MALLOC
++extern void *malloc(size_t size) LOWFAT_ALIAS("lowfat_malloc");
++#endif      /* LOWFAT_NO_REPLACE_STD_MALLOC */
++
++/*
++ * LOWFAT realloc()
++ */
++extern void *lowfat_realloc(void *ptr, size_t size)
++{
++    // (1) Check for cheap exits:
++    if (ptr == NULL || size == 0)
++        return lowfat_malloc(size);
++    if (lowfat_is_ptr(ptr) &&
++        lowfat_index(ptr) == lowfat_heap_select(size))
++    {
++        // `ptr' and `size' map to the same region; allocation can be avoided.
++        size_t alloc_size = LOWFAT_SIZES[lowfat_index(ptr)];
++        if (alloc_size >= LOWFAT_BIG_OBJECT)
++        {
++            void *prot_ptr = LOWFAT_PAGES_BASE(ptr);
++            size_t prot_size = LOWFAT_PAGES_SIZE(ptr, alloc_size);
++            mprotect(prot_ptr, prot_size, PROT_READ | PROT_WRITE);
++        }
++        return ptr;
++    }
++    if (!lowfat_is_ptr(ptr))
++        return lowfat_fallback_realloc(ptr, size);
++
++    // (2) Do the reallocation + copy:
++    void *newptr = lowfat_malloc(size);
++    if (newptr == NULL)
++        return NULL;
++    size_t cpy_size;
++    size_t idx = lowfat_index(ptr);
++    size_t ptr_size = LOWFAT_SIZES[idx];
++    cpy_size = (size < ptr_size? size: ptr_size);
++    if (ptr_size >= LOWFAT_BIG_OBJECT)
++    {
++        // Note: the allocator does not track the object size; only the
++        //       allocation size.  Some pages may be inaccessible.
++        //       The inaccessible pages must be made accessible before
++        //       copying.
++        void *prot_ptr = LOWFAT_PAGES_BASE(ptr);
++        size_t prot_size = LOWFAT_PAGES_SIZE(ptr, ptr_size);
++        mprotect(prot_ptr, prot_size, PROT_READ | PROT_WRITE);
++    }
++    memcpy(newptr, ptr, cpy_size);
++    lowfat_free(ptr);
++
++    return newptr;
++}
++
++/*
++ * LOWFAT calloc()
++ */
++extern void *lowfat_calloc(size_t nmemb, size_t size)
++{
++    void *ptr = lowfat_malloc(nmemb * size);
++    memset(ptr, 0, nmemb * size);
++    return ptr;
++}
++
++/*
++ * LOWFAT posix_memalign()
++ */
++extern int lowfat_posix_memalign(void **memptr, size_t align, size_t size)
++{
++    if (align < sizeof(void *) || (align & (align - 1)) != 0)
++        lowfat_error("invalid posix_memalign parameter: %s",
++            strerror(EINVAL));
++    if (align == LOWFAT_MIN_ALLOC_SIZE)
++        *memptr = lowfat_malloc(size);
++    else if (size < align)
++        *memptr = lowfat_malloc(align-1);
++    else
++    {
++        size_t nsize = size + align - 1;
++        uint8_t *ptr = (uint8_t *)lowfat_malloc(nsize);
++        size_t offset = (uintptr_t)ptr % align;
++        offset = (offset != 0? align - offset: offset);
++        ptr += offset;
++        *memptr = (void *)ptr;
++    }
++    return 0;
++}
++
++/*
++ * LOWFAT memalign()
++ */
++extern void *lowfat_memalign(size_t align, size_t size)
++{
++    void *ptr = NULL;
++    lowfat_posix_memalign(&ptr, align, size);
++    return ptr;
++}
++
++/*
++ * LOWFAT aligned_alloc()
++ */
++extern void *lowfat_aligned_alloc(size_t align, size_t size)
++    LOWFAT_ALIAS("lowfat_memalign");
++
++/*
++ * LOWFAT valloc()
++ */
++extern void *lowfat_valloc(size_t size)
++{
++    return lowfat_memalign(LOWFAT_PAGE_SIZE, size);
++}
++
++/*
++ * LOWFAT pvalloc()
++ */
++extern void *lowfat_pvalloc(size_t size)
++{
++    return lowfat_memalign(LOWFAT_PAGE_SIZE,
++        LOWFAT_NUM_PAGES(size) * LOWFAT_PAGE_SIZE);
++}
++
++/*
++ * LOWFAT C++ new
++ */
++extern void *lowfat__Znwm(size_t size) LOWFAT_ALIAS("lowfat_malloc");
++
++/*
++ * LOWFAT C++ new[]
++ */
++extern void *lowfat__Znam(size_t size) LOWFAT_ALIAS("lowfat_malloc");
++
++/*
++ * LOWFAT C++ new nothrow
++ */
++extern void *lowfat__ZnwmRKSt9nothrow_t(size_t size)
++    LOWFAT_ALIAS("lowfat_malloc");
++
++/*
++ * LOWFAT C++ new[] nothrow
++ */
++extern void *lowfat__ZnamRKSt9nothrow_t(size_t size)
++    LOWFAT_ALIAS("lowfat_malloc");
++
++/*
++ * LOWFAT C++ delete
++ */
++extern void lowfat__ZdlPv(void *ptr) LOWFAT_ALIAS("lowfat_free");
++
++/*
++ * LOWFAT C++ delete[]
++ */
++extern void lowfat__ZdaPv(void *ptr) LOWFAT_ALIAS("lowfat_free");
++
++/*
++ * LOWFAT strdup()
++ */
++extern char *lowfat_strdup(const char *str)
++{
++    size_t str_size = lowfat_buffer_size(str);
++    size_t len = strnlen(str, str_size);
++    if (len == str_size)
++        lowfat_oob_error(LOWFAT_OOB_ERROR_STRDUP, str + str_size,
++            lowfat_base(str));
++    char *str2 = (char *)lowfat_malloc(len+1);
++    memcpy(str2, str, len+1);
++    return str2;
++}
++
++/*
++ * LOWFAT strndup()
++ */
++extern char *lowfat_strndup(const char *str, size_t n)
++{
++    size_t str_size = lowfat_buffer_size(str);
++    size_t len = strnlen(str, (n > str_size? str_size: n));
++    if (len == str_size)
++        lowfat_oob_error(LOWFAT_OOB_ERROR_STRDUP, str + str_size,
++            lowfat_base(str));
++    char *str2 = (char *)lowfat_malloc(len+1);
++    memcpy(str2, str, len);
++    str2[len] = '\0';
++    return str2;
++}
++
++/*
++ * LOWFAT malloc_usable_size()
++ */
++typedef size_t (*malloc_usable_size_t)(void *);
++extern size_t malloc_usable_size(void *ptr)
++{
++    if (lowfat_is_ptr(ptr))
++        return lowfat_size(ptr);
++    malloc_usable_size_t libc_malloc_usable_size = NULL;
++    if (libc_malloc_usable_size == NULL)
++    {
++        libc_malloc_usable_size =
++            (malloc_usable_size_t)dlsym(RTLD_NEXT, "malloc_usable_size");
++        if (libc_malloc_usable_size == NULL)
++            lowfat_error("failed to find libc malloc_usable_size()");
++    }
++    return libc_malloc_usable_size(ptr);
++}
++
+diff --git a/lib/lowfat/lowfat_memops.c b/lib/lowfat/lowfat_memops.c
+new file mode 100644
+index 0000000..5250acf
+--- /dev/null
++++ b/lib/lowfat/lowfat_memops.c
+@@ -0,0 +1,52 @@
++/*
++ *   _|                                      _|_|_|_|            _|
++ *   _|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|
++ *   _|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|
++ *   _|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|
++ *   _|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|
++ * 
++ * Gregory J. Duck.
++ *
++ * Copyright (c) 2017 The National University of Singapore.
++ * All rights reserved.
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See the LICENSE file for details.
++ */
++
++/*
++ * LOWFAT memset
++ */
++extern void *lowfat_memset(void *dst, int c, size_t n)
++{
++    size_t size = lowfat_buffer_size(dst);
++    if (size < n)
++        lowfat_oob_error(LOWFAT_OOB_ERROR_MEMSET, (uint8_t *)dst + size,
++            lowfat_base(dst));
++    return memset(dst, c, n);
++}
++
++/*
++ * LOWFAT memmove
++ */
++extern void *lowfat_memmove(void *dst, const void *src, size_t n)
++{
++    size_t src_size = lowfat_buffer_size(src);
++    if (src_size < n)
++        lowfat_oob_error(LOWFAT_OOB_ERROR_MEMCPY, (uint8_t *)src + src_size,
++            lowfat_base(src));
++    size_t dst_size = lowfat_buffer_size(dst);
++    if (dst_size < n)
++        lowfat_oob_error(LOWFAT_OOB_ERROR_MEMCPY, (uint8_t *)dst + dst_size,
++            lowfat_base(dst));
++    return memmove(dst, src, n);
++}
++
++/*
++ * LOWFAT memcpy
++ */
++extern void *lowfat_memcpy(void *dst, const void *src, size_t n)
++{
++    return lowfat_memmove(dst, src, n);
++}
++
+diff --git a/lib/lowfat/lowfat_threads.c b/lib/lowfat/lowfat_threads.c
+new file mode 100644
+index 0000000..870ea5c
+--- /dev/null
++++ b/lib/lowfat/lowfat_threads.c
+@@ -0,0 +1,295 @@
++/*
++ *   _|                                      _|_|_|_|            _|
++ *   _|          _|_|    _|      _|      _|  _|        _|_|_|  _|_|_|_|
++ *   _|        _|    _|  _|      _|      _|  _|_|_|  _|    _|    _|
++ *   _|        _|    _|    _|  _|  _|  _|    _|      _|    _|    _|
++ *   _|_|_|_|    _|_|        _|      _|      _|        _|_|_|      _|_|
++ * 
++ * Gregory J. Duck.
++ *
++ * Copyright (c) 2017 The National University of Singapore.
++ * All rights reserved.
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See the LICENSE file for details.
++ */
++
++#include <pthread.h>
++#include <stddef.h>
++#include <dlfcn.h>
++
++#ifdef LOWFAT_NO_THREADS
++
++typedef int lowfat_mutex_t;
++
++static inline bool lowfat_mutex_init(lowfat_mutex_t *mutex)
++{
++    return true;
++}
++static inline void lowfat_mutex_lock(lowfat_mutex_t *mutex)
++{
++    return;
++}
++static inline void lowfat_mutex_unlock(lowfat_mutex_t *mutex)
++{
++    return;
++}
++
++#else   /* LOWFAT_NO_THREADS */
++
++typedef pthread_mutex_t lowfat_mutex_t;
++
++static inline bool lowfat_mutex_init(lowfat_mutex_t *mutex)
++{
++    return (pthread_mutex_init(mutex, NULL) == 0);
++}
++static inline void lowfat_mutex_lock(lowfat_mutex_t *mutex)
++{
++    pthread_mutex_lock(mutex);
++}
++static inline void lowfat_mutex_unlock(lowfat_mutex_t *mutex)
++{
++    pthread_mutex_unlock(mutex);
++}
++
++#endif  /* LOWFAT_NO_THREADS */
++
++#define LOWFAT_NUM_THREAD_STACKS                                            \
++    (LOWFAT_STACK_MEMORY_SIZE / LOWFAT_STACK_SIZE)
++#define LOWFAT_STACKS_START                                                 \
++    ((void *)((LOWFAT_STACK_REGION * LOWFAT_REGION_SIZE) +                  \
++        LOWFAT_STACK_MEMORY_OFFSET))
++#define LOWFAT_STACK_GUARD         (32 * LOWFAT_PAGE_SIZE)
++
++#define LOWFAT_STACK_BASE(ptr)                                              \
++    ((void *)((const uint8_t *)(ptr) - ((uintptr_t)(ptr) % LOWFAT_STACK_SIZE)))
++
++struct lowfat_stack_freelist_s
++{
++    pthread_t thread;
++    struct lowfat_stack_freelist_s *next;
++};
++
++static LOWFAT_DATA size_t lowfat_stack_freeidx = 0;
++static LOWFAT_DATA struct lowfat_stack_freelist_s *lowfat_stack_freelist = NULL;
++static LOWFAT_DATA lowfat_mutex_t lowfat_stack_mutex;
++static LOWFAT_DATA uint16_t lowfat_stack_perm[LOWFAT_NUM_THREAD_STACKS] = {0};
++
++/*
++ * Initialize lowfat thread handling.  Call after malloc init.
++ */
++static bool lowfat_threads_init(void)
++{
++    for (size_t i = 0; i < LOWFAT_NUM_THREAD_STACKS; i++)
++        lowfat_stack_perm[i] = i;
++    // Fisher-Yates shuffle:
++    for (size_t i = LOWFAT_NUM_THREAD_STACKS-1; i > 0; i--)
++    {
++        uint16_t j;
++        lowfat_rand(&j, sizeof(j));
++        j = j % (i + 1);
++        size_t tmp = lowfat_stack_perm[i];
++        lowfat_stack_perm[i] = lowfat_stack_perm[j];
++        lowfat_stack_perm[j] = tmp;
++    }
++    return lowfat_mutex_init(&lowfat_stack_mutex);
++}
++
++/*
++ * Tests if the given thread is still alive or not.
++ *
++ * This is a horrible hack that depends on libpthread internals.
++ * 
++ * Assumptions:
++ * - The `pthread_t' structure is allocated from the thread's stack itself,
++ *   and thus will still "exist" even after the thread terminates.
++ * - LOWFAT_TID_OFFSET is the offset of the `tid' field in a pthread_t
++ * - LOWFAT_JOINID_OFFSET is the offset of the `joinid' field in a pthread_t
++ * - When a thread terminates, the kernel zeroes the `tid'.
++ * - When a terminated thread is joined, `tid' is set to (-1), and this is a
++ *   final state.
++ * - Else, if a thread is detached, then `joinid' will be set to `thread',
++ *   thus (tid==0 && joinid==thread) is another final state.
++ * - Any other state and the thread is still alive, or is waiting to be
++ *   joined.
++ *
++ * NOTE: The magic constants LOWFAT_TID_OFFSET and LOWFAT_JOINID_OFFSET can
++ *       be determined by disassembling the libpthread pthread_detach()
++ *       function.
++ */
++static bool lowfat_is_thread_dead(pthread_t thread)
++{
++    pid_t *tid_ptr = (pid_t *)((uint8_t *)thread + LOWFAT_TID_OFFSET);
++    pthread_t *joinid_ptr =
++        (pthread_t *)((uint8_t *)thread + LOWFAT_JOINID_OFFSET);
++    if (*tid_ptr > 0)
++        return false;       // Thread is still active
++    else if (*tid_ptr != 0)
++        return true;        // Thread is dead + joined
++    else if (*joinid_ptr == thread)
++        return true;        // Thread is dead + detached
++    else
++        return false;       // Thread is a zombie waiting to be joined.
++}
++static void lowfat_force_thread_dead(pthread_t thread)
++{
++    pid_t *tid_ptr = (pid_t *)((uint8_t *)thread + LOWFAT_TID_OFFSET);
++    *tid_ptr = -1;
++}
++
++/*
++ * Allocate a new stack.
++ */
++static void *lowfat_stack_alloc(void)
++{
++    lowfat_mutex_lock(&lowfat_stack_mutex);
++
++    // STEP (1): Search the freelist for a free stack:
++    uint8_t *stack = NULL;
++    struct lowfat_stack_freelist_s *prev = NULL;
++    struct lowfat_stack_freelist_s *curr = lowfat_stack_freelist;
++    while (curr != NULL)
++    {
++        if (lowfat_is_thread_dead(curr->thread))
++        {
++            if (prev != NULL)
++                prev->next = curr->next;
++            else
++                lowfat_stack_freelist = curr->next;
++            stack = (uint8_t *)LOWFAT_STACK_BASE(curr);
++            lowfat_mutex_unlock(&lowfat_stack_mutex);
++            return stack;
++        }
++        prev = curr;
++        curr = curr->next;
++    }
++
++    // STEP (2): Else, allocate a new stack:
++    if (lowfat_stack_freeidx >= LOWFAT_NUM_THREAD_STACKS)
++    {
++        lowfat_mutex_unlock(&lowfat_stack_mutex);
++        errno = ENOMEM;
++        return NULL;
++    }
++    size_t stack_idx = lowfat_stack_freeidx;
++    lowfat_stack_freeidx++;
++
++    lowfat_mutex_unlock(&lowfat_stack_mutex);
++    
++    stack_idx = lowfat_stack_perm[stack_idx];
++    stack = (uint8_t *)LOWFAT_STACKS_START + stack_idx * LOWFAT_STACK_SIZE;
++    uint8_t *stack_lo = stack + LOWFAT_STACK_GUARD;
++    uint8_t *stack_hi = stack + LOWFAT_STACK_SIZE;
++    size_t idx;
++    for (size_t i = 0; (idx = lowfat_stacks[i]) != 0; i++)
++    {
++        ptrdiff_t diff = (uint8_t *)lowfat_region(LOWFAT_STACK_REGION) -
++            (uint8_t *)lowfat_region(idx);
++        if (mprotect(stack_lo - diff, stack_hi - stack_lo,
++                PROT_READ | PROT_WRITE) != 0)
++            return NULL;
++    }
++
++    return stack;
++}
++
++#ifndef LOWFAT_NO_THREADS
++
++/*
++ * Deallocate an old stack (used by `thread').  Note: the stack is not truely
++ * deallocated until `thread' exits.
++ * NOTE: the pthreads library will already madvise DONT_NEED the stack memory.
++ */
++static void lowfat_stack_free(pthread_t thread)
++{
++    uint8_t *nptr = (uint8_t *)LOWFAT_STACK_BASE(thread);
++    nptr += LOWFAT_STACK_SIZE - sizeof(struct lowfat_stack_freelist_s);
++    struct lowfat_stack_freelist_s *node =
++        (struct lowfat_stack_freelist_s *)nptr;
++    node->thread = thread;
++    lowfat_mutex_lock(&lowfat_stack_mutex);
++    node->next = lowfat_stack_freelist;
++    lowfat_stack_freelist = node;
++    lowfat_mutex_unlock(&lowfat_stack_mutex);
++}
++
++/*
++ * This is called if/when pthread_create() fails and "thread" does not exist.
++ * It creates a fake thread that is "dead" so the stack can be reused.
++ */
++static void lowfat_force_stack_free(void *stack)
++{
++    uint8_t *ptr = LOWFAT_STACK_BASE(stack);
++    ptr += LOWFAT_STACK_SIZE - LOWFAT_PAGE_SIZE;
++    pthread_t fake_thread = (pthread_t)ptr;
++    lowfat_force_thread_dead(fake_thread);
++    lowfat_stack_free(fake_thread);
++}
++
++/*
++ * LOWFAT pthread_create()
++ */
++extern int lowfat_pthread_create(pthread_t *thread,
++    const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
++    LOWFAT_ALIAS("pthread_create");
++typedef int (*pthread_create_t)(pthread_t *, const pthread_attr_t *,
++    void *(*)(void *), void *);
++extern int pthread_create(pthread_t *thread,
++    const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
++{
++    static pthread_create_t real_pthread_create = NULL;
++    if (real_pthread_create == NULL)
++    {
++        lowfat_mutex_init(&lowfat_stack_mutex);
++        real_pthread_create =
++            (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
++        if (real_pthread_create == NULL ||
++                real_pthread_create == pthread_create)
++            lowfat_error("failed to find pthread_create");
++    }
++
++    void *stack;
++    size_t stack_size;
++    pthread_attr_t newattr;
++    int err;
++    if (attr != NULL)
++    {
++        err = pthread_attr_getstack(attr, &stack, &stack_size);
++        if (err != 0)
++            lowfat_error("pthread_attr_getstack failed: %s", strerror(err));
++        if (stack != NULL || stack_size != 0)
++            lowfat_warning("custom pthread stack will be replaced with a "
++                "lowfat stack");
++        memcpy(&newattr, attr, sizeof(newattr));
++    }
++    else
++    {
++        err = pthread_attr_init(&newattr);
++        if (err != 0)
++            lowfat_error("pthread_attr_init failed: %s", strerror(errno));
++    }
++
++    stack = lowfat_stack_alloc();
++    if (stack == NULL)
++        lowfat_error("failed to allocate stack for new thread");
++    stack_size = LOWFAT_STACK_SIZE - sizeof(struct lowfat_stack_freelist_s);
++
++    err = pthread_attr_setstack(&newattr, stack, stack_size);
++    if (err != 0)
++        lowfat_error("pthread_attr_setstack failed: %s", strerror(err));
++
++    err = real_pthread_create(thread, &newattr, start_routine, arg);
++    if (err != 0)
++    {
++        lowfat_force_stack_free(stack);
++        return err;
++    }
++    lowfat_stack_free(*thread);     // "Free" the stack.  It is not really
++                                    // free until the thread terminates & is
++                                    // joined (if applicable).
++
++    return err;
++}
++
++#endif  /* LOWFAT_NO_THREADS */
++

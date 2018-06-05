@@ -1,0 +1,2607 @@
+diff --git a/include/llvm/InitializePasses.h b/include/llvm/InitializePasses.h
+index 16f978a..8fe92c7 100644
+--- a/include/llvm/InitializePasses.h
++++ b/include/llvm/InitializePasses.h
+@@ -324,6 +324,8 @@ void initializeLoopLoadEliminationPass(PassRegistry&);
+ void initializeFunctionImportPassPass(PassRegistry &);
+ void initializeLoopVersioningPassPass(PassRegistry &);
+ void initializeWholeProgramDevirtPass(PassRegistry &);
++void initializeHexTypePass(PassRegistry&);
++void initializeHexTypeTreePass(PassRegistry&);
+ }
+ 
+ #endif
+diff --git a/include/llvm/Transforms/Instrumentation.h b/include/llvm/Transforms/Instrumentation.h
+index ad65e0d..f66f220 100644
+--- a/include/llvm/Transforms/Instrumentation.h
++++ b/include/llvm/Transforms/Instrumentation.h
+@@ -111,6 +111,12 @@ FunctionPass *createMemorySanitizerPass(int TrackOrigins = 0);
+ // Insert ThreadSanitizer (race detection) instrumentation
+ FunctionPass *createThreadSanitizerPass();
+ 
++// Insert HexType (stack/global object tracing) instrumenation
++ModulePass *createHexTypePass();
++
++// Insert HexType (heap object tracing) instrumentation
++ModulePass *createHexTypeTreePass();
++
+ // Insert DataFlowSanitizer (dynamic data flow analysis) instrumentation
+ ModulePass *createDataFlowSanitizerPass(
+     const std::vector<std::string> &ABIListFiles = std::vector<std::string>(),
+diff --git a/include/llvm/Transforms/Utils/HexTypeUtil.h b/include/llvm/Transforms/Utils/HexTypeUtil.h
+new file mode 100644
+index 0000000..daf8261
+--- /dev/null
++++ b/include/llvm/Transforms/Utils/HexTypeUtil.h
+@@ -0,0 +1,149 @@
++//===- HexTypeUtil.h - helper functions and classes for HexType ----*- C++-*-===//
++////
++////                     The LLVM Compiler Infrastructure
++////
++//// This file is distributed under the University of Illinois Open Source
++//// License. See LICENSE.TXT for details.
++////
++////===----------------------------------------------------------------------===//
++
++#ifndef LLVM_TRANSFORMS_UTILS_HEXTYPE_H
++#define LLVM_TRANSFORMS_UTILS_HEXTYPE_H
++
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/Support/raw_ostream.h"
++#include <algorithm>
++#include <set>
++#include <list>
++
++#define MAXNODE 1000000
++
++#define STACKALLOC 1
++#define HEAPALLOC 2
++#define GLOBALALLOC 3
++#define REALLOC 4
++#define PLACEMENTNEW 5
++#define REINTERPRET 6
++
++#define CONOBJADD 1
++#define VLAOBJADD 2
++#define CONOBJDEL 3
++#define VLAOBJDEL 4
++
++namespace llvm {
++
++  extern cl::opt<bool> ClStackOpt;
++  extern cl::opt<bool> ClCastObjOpt;
++  extern cl::opt<bool> ClSafeStackOpt;
++  extern cl::opt<bool> ClCompileTimeVerifyOpt;
++  extern cl::opt<bool> ClCreateCastRelatedTypeList;
++  extern cl::opt<bool> ClInlineOpt;
++  extern cl::opt<bool> ClMakeLogInfo;
++  extern cl::opt<bool> ClMakeTypeInfo;
++
++  typedef std::list<std::pair<uint64_t, StructType*>> StructElementInfoTy;
++  typedef std::map<Function *, std::vector<Instruction *> *> FunctionReturnTy;
++
++  class TypeDetailInfo {
++  public:
++    uint64_t TypeHashValue;
++    uint32_t TypeIndex;
++    std::string TypeName;
++  };
++
++  class TypeInfo {
++  public:
++    StructType *StructTy;
++    TypeDetailInfo DetailInfo;
++    uint32_t ElementSize;
++
++    std::vector<TypeDetailInfo> DirectParents;
++    std::vector<TypeDetailInfo> DirectPhantomTypes;
++    std::vector<TypeDetailInfo> AllParents;
++    std::vector<TypeDetailInfo> AllPhantomTypes;
++  };
++
++  class HexTypeCommonUtil {
++  public:
++    static uint64_t getHashValueFromStr(std::string &);
++    static uint64_t getHashValueFromSTy(StructType *);
++    static void syncTypeName(std::string &);
++    static bool isInterestingStructType(StructType *);
++    void updateCastingReleatedTypeIntoFile(Type *);
++    bool isInterestingType(Type *);
++    void writeInfoToFile(char *, char *);
++  };
++
++  class HexTypeLLVMUtil : public HexTypeCommonUtil {
++  public:
++    HexTypeLLVMUtil(const DataLayout &DL)
++      : DL(DL) {
++      }
++
++    const DataLayout &DL;
++
++    Type *VoidTy;
++    Type *Int8PtrTy;
++    Type *Int32PtrTy;
++    Type *Int64PtrTy;
++    Type *IntptrTyN;
++    Type *IntptrTy;
++    Type *Int128Ty;
++    Type *Int64Ty;
++    Type *Int32Ty;
++    Type *Int8Ty;
++    Type *Int1Ty;
++
++    uint32_t AllTypeNum = 0;
++
++    std::vector<TypeInfo> AllTypeInfo;
++    std::vector<Constant*> typeInfoArray;
++    std::vector<Constant*> typePhantomInfoArray;
++    std::vector<uint64_t> typeInfoArrayInt;
++    std::set<std::string> CastingRelatedSet;
++    std::set<std::string> CastingRelatedExtendSet;
++
++    GlobalVariable *typeInfoArrayGlobal;
++    GlobalVariable *typePhantomInfoArrayGlobal;
++
++    static void syncModuleName(std::string &);
++    void initType(Module &);
++    void createObjRelationInfo(Module &);
++    Instruction *findNextInstruction(Instruction *);
++    AllocaInst *findAllocaForValue(Value *);
++    void emitRemoveInst(Module *, IRBuilder<> &, AllocaInst *);
++    void getStructOffsets(StructType *, StructElementInfoTy &, uint32_t);
++    void getArrayOffsets(Type *, StructElementInfoTy &, uint32_t);
++    void insertUpdate(Module *, IRBuilder<> &, std::string, Value *,
++                      StructElementInfoTy &, uint32_t , Value *,
++                      Value *, BasicBlock *);
++    void insertRemove(Module *, IRBuilder<> &, std::string, Value *,
++                      StructElementInfoTy &, Value *, int , BasicBlock *);
++    bool isInterestingFn(Function *);
++    bool isSafeStackAlloca(AllocaInst *);
++    void setCastingRelatedSet();
++    void extendCastingRelatedTypeSet();
++    GlobalVariable *getVerifyResultCache(Module &);
++    GlobalVariable *getObjTypeMap(Module &);
++    GlobalVariable *emitAsGlobalVal(Module &, char *, std::vector<Constant*> *);
++    void getTypeInfoFromClang();
++
++  private:
++    bool VisitCheck[MAXNODE];
++    void parsingTypeInfo(StructType *, TypeInfo &, uint32_t);
++    void getDirectTypeInfo(Module &);
++    void setTypeDetailInfo(StructType *, TypeDetailInfo &, uint32_t);
++
++    void extendParentSet(int , int );
++    void extendPhantomSet(int , int );
++    void extendTypeRelationInfo();
++    void sortSet(std::set<uint64_t> &);
++    void getSortedAllParentSet();
++    void getSortedAllPhantomSet();
++    void removeNonCastingRelatedObj(StructElementInfoTy &);
++    void emitInstForObjTrace(Module *, IRBuilder<> &, StructElementInfoTy &,
++                             uint32_t , Value *, Value *, uint32_t , uint32_t,
++                             uint32_t , Value *, BasicBlock *);
++  };
++} // llvm namespace
++#endif  // LLVM_TRANSFORMS_UTILS_HEXTYPE_H
+diff --git a/lib/Analysis/MemoryBuiltins.cpp b/lib/Analysis/MemoryBuiltins.cpp
+index b181292..8707525 100644
+--- a/lib/Analysis/MemoryBuiltins.cpp
++++ b/lib/Analysis/MemoryBuiltins.cpp
+@@ -87,8 +87,8 @@ static Function *getCalledFunction(const Value *V, bool LookThroughBitCast) {
+   if (!CS.getInstruction())
+     return nullptr;
+ 
+-  if (CS.isNoBuiltin())
+-    return nullptr;
++//if (CS.isNoBuiltin())
++//  return nullptr;
+ 
+   Function *Callee = CS.getCalledFunction();
+   if (!Callee || !Callee->isDeclaration())
+@@ -228,7 +228,7 @@ static Value *computeArraySize(const CallInst *CI, const DataLayout &DL,
+ ///  >1: Unique PointerType cannot be determined, return NULL.
+ PointerType *llvm::getMallocType(const CallInst *CI,
+                                  const TargetLibraryInfo *TLI) {
+-  assert(isMallocLikeFn(CI, TLI) && "getMallocType and not malloc call");
++  //assert(isMallocLikeFn(CI, TLI) && "getMallocType and not malloc call");
+ 
+   PointerType *MallocType = nullptr;
+   unsigned NumOfBitCastUses = 0;
+diff --git a/lib/Transforms/Instrumentation/CMakeLists.txt b/lib/Transforms/Instrumentation/CMakeLists.txt
+index 271e310..b092531 100644
+--- a/lib/Transforms/Instrumentation/CMakeLists.txt
++++ b/lib/Transforms/Instrumentation/CMakeLists.txt
+@@ -9,6 +9,8 @@ add_llvm_library(LLVMInstrumentation
+   PGOInstrumentation.cpp
+   SanitizerCoverage.cpp
+   ThreadSanitizer.cpp
++  HexTypePass.cpp
++  HexTypeTreePass.cpp
+ 
+   ADDITIONAL_HEADER_DIRS
+   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
+diff --git a/lib/Transforms/Instrumentation/HexTypePass.cpp b/lib/Transforms/Instrumentation/HexTypePass.cpp
+new file mode 100644
+index 0000000..787b050
+--- /dev/null
++++ b/lib/Transforms/Instrumentation/HexTypePass.cpp
+@@ -0,0 +1,444 @@
++//===-- HexTypePass.cpp -----------------------------------------------===//
++//
++// This file is a part of HexType, a type confusion detector.
++//
++// The HexTypePass has below two functions:
++//   - Track Stack object allocation
++//   - Track Global object allocation
++// This pass will run after all optimization passes run
++// The rest is handled by the run-time library.
++//===------------------------------------------------------------------===//
++
++#include "llvm/Analysis/CallGraph.h"
++#include "llvm/Pass.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++#include "llvm/Transforms/Instrumentation.h"
++
++using namespace llvm;
++#define MAXLEN 10000
++
++namespace {
++
++  struct HexType : public ModulePass {
++    static char ID;
++    HexType() : ModulePass(ID) {}
++
++    HexTypeLLVMUtil *HexTypeUtilSet;
++    CallGraph *CG;
++
++    std::list<AllocaInst *> AllAllocaSet;
++    std::map<AllocaInst *, IntrinsicInst *> LifeTimeEndSet;
++    std::map<AllocaInst *, IntrinsicInst *> LifeTimeStartSet;
++    std::map<Function *, std::vector<Instruction *> *> ReturnInstSet;
++    std::map<Instruction *, Function *> AllAllocaWithFnSet;
++    std::map<Function*, bool> mayCastMap;
++
++    void getAnalysisUsage(AnalysisUsage &Info) const {
++      Info.addRequired<CallGraphWrapperPass>();
++    }
++
++    Function *setGlobalObjUpdateFn(Module &M) {
++      FunctionType *VoidFTy =
++        FunctionType::get(Type::getVoidTy(M.getContext()), false);
++      Function *FGlobal = Function::Create(VoidFTy,
++                                           GlobalValue::InternalLinkage,
++                                           "__init_global_object", &M);
++      FGlobal->setUnnamedAddr(true);
++      FGlobal->setLinkage(GlobalValue::InternalLinkage);
++      FGlobal->addFnAttr(Attribute::NoInline);
++
++      return FGlobal;
++    }
++
++    void handleFnPrameter(Module &M, Function *F) {
++      if (F->empty() || F->getEntryBlock().empty() ||
++          F->getName().startswith("__init_global_object"))
++        return;
++
++      Type *MemcpyParams[] = { HexTypeUtilSet->Int8PtrTy,
++        HexTypeUtilSet->Int8PtrTy,
++        HexTypeUtilSet->Int64Ty };
++      Function *MemcpyFunc =
++        Intrinsic::getDeclaration(&M, Intrinsic::memcpy, MemcpyParams);
++      for (auto &a : F->args()) {
++        Argument *Arg = dyn_cast<Argument>(&a);
++        if (!Arg->hasByValAttr())
++          return;
++        Type *ArgPointedTy = Arg->getType()->getPointerElementType();
++        if (HexTypeUtilSet->isInterestingType(ArgPointedTy)) {
++          unsigned long size =
++            HexTypeUtilSet->DL.getTypeStoreSize(ArgPointedTy);
++          IRBuilder<> B(&*(F->getEntryBlock().getFirstInsertionPt()));
++          Value *NewAlloca = B.CreateAlloca(ArgPointedTy);
++          Arg->replaceAllUsesWith(NewAlloca);
++          Value *Src = B.CreatePointerCast(Arg,
++                                           HexTypeUtilSet->Int8PtrTy);
++          Value *Dst = B.CreatePointerCast(NewAlloca,
++                                           HexTypeUtilSet->Int8PtrTy);
++          Value *Param[5] = { Dst, Src,
++            ConstantInt::get(HexTypeUtilSet->Int64Ty, size),
++            ConstantInt::get(HexTypeUtilSet->Int32Ty, 1),
++            ConstantInt::get(HexTypeUtilSet->Int1Ty, 0) };
++          B.CreateCall(MemcpyFunc, Param);
++        }
++      }
++    }
++
++    void collectLifeTimeInfo(Instruction *I) {
++      if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I))
++        if ((II->getIntrinsicID() == Intrinsic::lifetime_start)
++           || (II->getIntrinsicID() == Intrinsic::lifetime_end)) {
++          ConstantInt *Size =
++            dyn_cast<ConstantInt>(II->getArgOperand(0));
++          if (Size->isMinusOne()) return;
++
++          if (AllocaInst *AI =
++             HexTypeUtilSet->findAllocaForValue(II->getArgOperand(1))) {
++            if (II->getIntrinsicID() == Intrinsic::lifetime_start)
++              LifeTimeStartSet.insert(std::pair<AllocaInst *,
++                                   IntrinsicInst *>(AI, II));
++
++            else if (II->getIntrinsicID() == Intrinsic::lifetime_end)
++              LifeTimeEndSet.insert(std::pair<AllocaInst *,
++                                 IntrinsicInst *>(AI, II));
++          }
++        }
++    }
++
++    void collectAllocaInstInfo(Instruction *I) {
++      if (AllocaInst *AI = dyn_cast<AllocaInst>(I))
++        if (HexTypeUtilSet->isInterestingType(AI->getAllocatedType())) {
++          if (ClSafeStackOpt && HexTypeUtilSet->isSafeStackAlloca(AI))
++            return;
++          AllAllocaWithFnSet.insert(
++            std::pair<Instruction *, Function *>(
++              dyn_cast<Instruction>(I), AI->getParent()->getParent()));
++          AllAllocaSet.push_back(AI);
++        }
++    }
++
++    void handleAllocaAdd(Module &M) {
++      for (AllocaInst *AI : AllAllocaSet) {
++        Instruction *next = HexTypeUtilSet->findNextInstruction(AI);
++        IRBuilder<> Builder(next);
++
++        Value *ArraySizeF = NULL;
++        if (ConstantInt *constantSize =
++            dyn_cast<ConstantInt>(AI->getArraySize()))
++          ArraySizeF =
++            ConstantInt::get(HexTypeUtilSet->Int64Ty,
++                             constantSize->getZExtValue());
++        else {
++          Value *ArraySize = AI->getArraySize();
++          if (ArraySize->getType() != HexTypeUtilSet->Int64Ty)
++            ArraySizeF = Builder.CreateIntCast(ArraySize,
++                                               HexTypeUtilSet->Int64Ty,
++                                               false);
++          else
++            ArraySizeF = ArraySize;
++        }
++
++        Type *AllocaType = AI->getAllocatedType();
++        StructElementInfoTy offsets;
++        HexTypeUtilSet->getArrayOffsets(AllocaType, offsets, 0);
++        if(offsets.size() == 0) continue;
++
++        std::map<AllocaInst *, IntrinsicInst *>::iterator LifeTimeStart, LifeTimeEnd;
++        LifeTimeStart = LifeTimeStartSet.begin();
++        LifeTimeEnd = LifeTimeStartSet.end();
++        bool UseLifeTimeInfo = false;
++
++        for (; LifeTimeStart != LifeTimeEnd; LifeTimeStart++)
++          if (LifeTimeStart->first == AI) {
++            IRBuilder<> BuilderAI(LifeTimeStart->second);
++            HexTypeUtilSet->insertUpdate(&M, BuilderAI, "__update_stack_oinfo",
++                                         AI, offsets,
++                                         HexTypeUtilSet->DL.getTypeAllocSize(
++                                           AllocaType),
++                                         ArraySizeF, NULL, NULL);
++            UseLifeTimeInfo = true;
++          }
++
++        if (UseLifeTimeInfo)
++          continue;
++
++        HexTypeUtilSet->insertUpdate(&M, Builder, "__update_stack_oinfo",
++                                     AI, offsets,
++                                     HexTypeUtilSet->DL.getTypeAllocSize(
++                                       AllocaType),
++                                     ArraySizeF, NULL, NULL);
++      }
++    }
++
++    void findReturnInsts(Function *f) {
++      std::vector<Instruction*> *TempInstSet = new std::vector<Instruction *>;
++      for (inst_iterator j = inst_begin(f), E = inst_end(f); j != E; ++j)
++        if (isa<ReturnInst>(&*j))
++          TempInstSet->push_back(&*j);
++
++      ReturnInstSet.insert(std::pair<Function *,
++                           std::vector<Instruction *>*>(f, TempInstSet));
++    }
++
++    void handleAllocaDelete(Module &M) {
++      std::map<Instruction *, Function *>::iterator LocalBegin, LocalEnd;
++      LocalBegin = AllAllocaWithFnSet.begin();
++      LocalEnd = AllAllocaWithFnSet.end();
++
++      for (; LocalBegin != LocalEnd; LocalBegin++){
++        Instruction *TargetInst = LocalBegin->first;
++        AllocaInst *TargetAlloca = dyn_cast<AllocaInst>(TargetInst);
++
++        Function *TargetFn = LocalBegin->second;
++
++        std::vector<Instruction *> *FnReturnSet;
++        FnReturnSet = ReturnInstSet.find(TargetFn)->second;
++
++        std::vector<Instruction *>::iterator ReturnInstCur, ReturnInstEnd;
++        ReturnInstCur = FnReturnSet->begin();
++        ReturnInstEnd = FnReturnSet->end();
++        DominatorTree dt = DominatorTree(*TargetFn);
++
++        bool returnAI = false;
++        for (; ReturnInstCur != ReturnInstEnd; ReturnInstCur++)
++          if (dt.dominates(TargetInst, *ReturnInstCur)) {
++            ReturnInst *returnValue = dyn_cast<ReturnInst>(*ReturnInstCur);
++            if (returnValue->getNumOperands() &&
++                returnValue->getOperand(0) == TargetAlloca) {
++              returnAI = true;
++              break;
++            }
++          }
++
++        if (returnAI)
++          continue;
++
++        std::map<AllocaInst *, IntrinsicInst *>::iterator LifeTimeStart,
++          LifeTimeEnd;
++        LifeTimeStart = LifeTimeEndSet.begin();
++        LifeTimeEnd = LifeTimeEndSet.end();
++        bool lifeTimeEndEnable = false;
++        for (; LifeTimeStart != LifeTimeEnd; LifeTimeStart++)
++          if (LifeTimeStart->first == TargetAlloca) {
++            IRBuilder<> BuilderAI(LifeTimeStart->second);
++            HexTypeUtilSet->emitRemoveInst(&M, BuilderAI, TargetAlloca);
++            lifeTimeEndEnable = true;
++          }
++
++        if (lifeTimeEndEnable)
++          continue;
++
++        ReturnInstCur = FnReturnSet->begin();
++        ReturnInstEnd = FnReturnSet->end();
++
++        for (; ReturnInstCur != ReturnInstEnd; ReturnInstCur++)
++          if (dt.dominates(TargetInst, *ReturnInstCur)) {
++            IRBuilder<> BuilderAI(*ReturnInstCur);
++            HexTypeUtilSet->emitRemoveInst(&M, BuilderAI, TargetAlloca);
++          }
++      }
++    }
++
++    // This is typesan's optimization method
++    // to reduce stack object tracing overhead
++    bool mayCast(Function *F, std::set<Function*> &visited, bool *isComplete) {
++      // Externals may cast
++      if (F->isDeclaration())
++        return true;
++
++      // Check previously processed
++      auto mayCastIterator = mayCastMap.find(F);
++      if (mayCastIterator != mayCastMap.end())
++        return mayCastIterator->second;
++
++      visited.insert(F);
++
++      bool isCurrentComplete = true;
++      for (auto &I : *(*CG)[F]) {
++        return true;
++        Function *calleeFunction = I.second->getFunction();
++        // Default to true to avoid accidental bugs on API changes
++        bool result = false;
++        // Indirect call
++        if (!calleeFunction) {
++          result = true;
++          // Recursion detected, do not process callee
++        } else if (visited.count(calleeFunction)) {
++          isCurrentComplete = false;
++          // Explicit call to checker
++        } else if (
++          calleeFunction->getName().find("__dynamic_casting_verification") !=
++          StringRef::npos ||
++          calleeFunction->getName().find("__type_casting_verification_changing") !=
++          StringRef::npos ||
++          calleeFunction->getName().find("__type_casting_verification") !=
++          StringRef::npos) {
++          result = true;
++          // Check recursively
++        } else {
++          bool isCalleeComplete;
++          result = mayCast(calleeFunction, visited, &isCalleeComplete);
++          // Forbid from caching if callee was not complete (due to recursion)
++          isCurrentComplete &= isCalleeComplete;
++        }
++        // Found a potentialy cast, report true
++        if (result) {
++          // Cache and report even if it was incomplete
++          // Missing traversal can never flip it to not found
++          mayCastMap.insert(std::make_pair(F, true));
++          *isComplete = true;
++          return true;
++        }
++      }
++
++      // No cast found anywhere, report false
++      // Do not cache negative results if current traversal
++      // was not complete (due to recursion)
++      /*if (isCurrentComplete) {
++        mayCastMap.insert(std::make_pair(F, false));
++        }*/
++      // Report to caller that this traversal was incomplete
++      *isComplete = isCurrentComplete;
++      return false;
++    }
++
++    bool isSafeStackFn(Function *F) {
++      assert(F && "Function can't be null");
++
++      std::set<Function*> visitedFunctions;
++      bool tmp;
++      bool mayCurrentCast = mayCast(&*F, visitedFunctions, &tmp);
++      mayCastMap.insert(std::make_pair(&*F, mayCurrentCast));
++      if (!mayCurrentCast)
++        return false;
++
++      return true;
++    }
++
++    void stackObjTracing(Module &M) {
++      for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
++        if(!HexTypeUtilSet->isInterestingFn(&*F))
++          continue;
++        // Apply stack optimization
++        if (ClStackOpt && !isSafeStackFn(&*F))
++          continue;
++
++        handleFnPrameter(M, &*F);
++        for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB)
++          for (BasicBlock::iterator i = BB->begin(),
++               ie = BB->end(); i != ie; ++i) {
++            collectLifeTimeInfo(&*i);
++            collectAllocaInstInfo(&*i);
++          }
++        findReturnInsts(&*F);
++      }
++      handleAllocaAdd(M);
++      handleAllocaDelete(M);
++    }
++
++    void globalObjTracing(Module &M) {
++      Function *FGlobal = setGlobalObjUpdateFn(M);
++      BasicBlock *BBGlobal = BasicBlock::Create(M.getContext(),
++                                                "entry", FGlobal);
++      IRBuilder<> BuilderGlobal(BBGlobal);
++
++      for (GlobalVariable &GV : M.globals()) {
++        if (GV.getName() == "llvm.global_ctors" ||
++            GV.getName() == "llvm.global_dtors" ||
++            GV.getName() == "llvm.global.annotations" ||
++            GV.getName() == "llvm.used")
++          continue;
++
++        if (HexTypeUtilSet->isInterestingType(GV.getValueType())) {
++          StructElementInfoTy offsets;
++          Value *NElems = NULL;
++          Type *AllocaType;
++
++          if(isa<ArrayType>(GV.getValueType())) {
++            ArrayType *AI = dyn_cast<ArrayType>(GV.getValueType());
++            AllocaType = AI->getElementType();
++            NElems = ConstantInt::get(HexTypeUtilSet->Int64Ty,
++                                      AI->getNumElements());
++          }
++          else {
++            AllocaType = GV.getValueType();
++            NElems = ConstantInt::get(HexTypeUtilSet->Int64Ty, 1);
++          }
++
++          HexTypeUtilSet->getArrayOffsets(AllocaType, offsets, 0);
++          if(offsets.size() == 0) continue;
++
++          HexTypeUtilSet->insertUpdate(&M, BuilderGlobal,
++                                       "__update_global_oinfo",
++                                       &GV, offsets, HexTypeUtilSet->DL.
++                                       getTypeAllocSize(AllocaType),
++                                       NElems, NULL, BBGlobal);
++        }
++      }
++      BuilderGlobal.CreateRetVoid();
++      appendToGlobalCtors(M, FGlobal, 0);
++    }
++
++    void emitTypeInfoAsGlobalVal(Module &M) {
++      std::string mname = M.getName();
++      HexTypeUtilSet->syncModuleName(mname);
++
++      char ParentSetGlobalValName[MAXLEN];
++
++      strcpy(ParentSetGlobalValName, mname.c_str());
++      strcat(ParentSetGlobalValName, ".hextypepass_cinfo");
++
++      HexTypeUtilSet->typeInfoArrayGlobal =
++        HexTypeUtilSet->emitAsGlobalVal(M, ParentSetGlobalValName,
++                        &(HexTypeUtilSet->typeInfoArray));
++
++    }
++
++    virtual bool runOnModule(Module &M) {
++      // init HexTypePass
++      CG = &getAnalysis<CallGraphWrapperPass>().getCallGraph();
++      HexTypeLLVMUtil HexTypeUtilSetT(M.getDataLayout());
++      HexTypeUtilSet = &HexTypeUtilSetT;
++      HexTypeUtilSet->initType(M);
++
++      HexTypeUtilSet->createObjRelationInfo(M);
++      if (HexTypeUtilSet->AllTypeInfo.size() > 0)
++        emitTypeInfoAsGlobalVal(M);
++
++      // Init for only tracing casting related objects
++      if (ClCastObjOpt || ClCreateCastRelatedTypeList)
++        HexTypeUtilSet->setCastingRelatedSet();
++
++      // Global object tracing
++      globalObjTracing(M);
++
++      // Stack object tracing
++      stackObjTracing(M);
++      return false;
++    }
++  };
++}
++
++//register pass
++char HexType::ID = 0;
++INITIALIZE_PASS_BEGIN(HexType, "HexType",
++                      "HexTypePass: fast type safety for C++ programs.",
++                      false, false)
++INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
++INITIALIZE_PASS_END(HexType, "HexType",
++                    "HexTypePass: fast type safety for C++ programs.",
++                    false, false)
++ModulePass *llvm::createHexTypePass() {
++  return new HexType();
++}
+diff --git a/lib/Transforms/Instrumentation/HexTypeTreePass.cpp b/lib/Transforms/Instrumentation/HexTypeTreePass.cpp
+new file mode 100644
+index 0000000..3ea18bd
+--- /dev/null
++++ b/lib/Transforms/Instrumentation/HexTypeTreePass.cpp
+@@ -0,0 +1,751 @@
++//===-- HexTypeTreePass.cpp -----------------------------------------------===//
++//
++// This file is a part of HexType, a type confusion detector.
++//
++// The HexTypeTreePass has below two functions:
++//   - Create object relationship information.
++//   - Compile time verification
++// This pass will run before all optimization passes run
++// The rest is handled by the run-time library.
++//===----------------------------------------------------------------------===//
++
++#include "llvm/Pass.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/Analysis/TargetLibraryInfo.h"
++#include "llvm/Analysis/MemoryBuiltins.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <cxxabi.h>
++
++#define MAXLEN 10000
++
++using namespace llvm;
++
++namespace {
++  struct HexTypeTree : public ModulePass {
++    static char ID;
++    HexTypeTree() : ModulePass(ID) {}
++
++    TargetLibraryInfo *tli;
++    TargetLibraryInfoImpl tlii;
++
++    HexTypeLLVMUtil *HexTypeUtilSet;
++
++    void emitPhantomTypeInfo(Module &M) {
++      FunctionType *FTy = FunctionType::get(HexTypeUtilSet->VoidTy, false);
++      Function *F = Function::Create(FTy, GlobalValue::InternalLinkage,
++                                     "__init", &M);
++
++      F->setUnnamedAddr(true);
++      F->setLinkage(GlobalValue::InternalLinkage);
++      F->addFnAttr(Attribute::NoInline);
++
++      BasicBlock *BB = BasicBlock::Create(M.getContext(), "entry", F);
++      IRBuilder<> Builder(BB);
++
++      std::string initName = "__update_phantom_info";
++      Constant *GCOVInit = M.getOrInsertFunction(initName,
++                                                 HexTypeUtilSet->VoidTy,
++                                                 HexTypeUtilSet->Int64PtrTy,
++                                                 nullptr);
++      Builder.CreateCall(GCOVInit,
++                         Builder.CreatePointerCast(
++                           HexTypeUtilSet->typePhantomInfoArrayGlobal,
++                           HexTypeUtilSet->Int64PtrTy));
++      Builder.CreateRetVoid();
++      appendToGlobalCtors(M, F, 0);
++    }
++
++    void emitExtendObjTraceInst(Module &M, int hashIndex,
++                                CallInst *call, int extendTarget) {
++      ConstantInt *HashValueConst =
++        dyn_cast<ConstantInt>(call->getOperand(1));
++      uint64_t TargetHashValue = HashValueConst->getZExtValue();
++
++      if (ClCastObjOpt) {
++        bool isSafeObj = true;
++        std::set<std::string>::iterator it;
++        for (it = HexTypeUtilSet->CastingRelatedSet.begin();
++             it != HexTypeUtilSet->CastingRelatedSet.end(); ++it) {
++          std::string TargetStr = *it;
++          uint64_t TmpHash = HexTypeUtilSet->getHashValueFromStr(TargetStr);
++          if (TmpHash == TargetHashValue)
++            isSafeObj = false;
++        }
++
++        if (isSafeObj) return;
++      }
++
++      std::string funName;
++      if (extendTarget == PLACEMENTNEW)
++        funName.assign("__placement_new_handle");
++      else
++        funName.assign("__reinterpret_casting_handle");
++
++      Instruction *next = HexTypeUtilSet->findNextInstruction(call);
++      IRBuilder<> Builder(next);
++
++      StructElementInfoTy Elements;
++      StructType *EmptySet = nullptr;
++      Elements.push_back(std::make_pair(TargetHashValue, EmptySet));
++
++      Value *first = Builder.CreatePtrToInt(call->getOperand(0),
++                                            HexTypeUtilSet->IntptrTyN);
++      Value *second = Builder.CreatePtrToInt(call->getOperand(2),
++                                             HexTypeUtilSet->IntptrTyN);
++      Value *NewAddr = Builder.CreateAdd(first, second);
++      Value *ObjAddrT = Builder.CreateIntToPtr(NewAddr,
++                                               HexTypeUtilSet->IntptrTyN);
++      HexTypeUtilSet->insertUpdate(&M, Builder, funName, ObjAddrT,
++                                   Elements, 0, NULL, NULL, NULL);
++      if (ClMakeLogInfo) {
++        Function *ObjUpdateFunction =
++          (Function*)M.getOrInsertFunction(
++            "__obj_update_count", HexTypeUtilSet->VoidTy,
++            HexTypeUtilSet->Int32Ty,
++            HexTypeUtilSet->Int64Ty,
++            nullptr);
++        Value *AllocType;
++        if (extendTarget == PLACEMENTNEW)
++          AllocType = ConstantInt::get(HexTypeUtilSet->Int32Ty, PLACEMENTNEW);
++        else
++          AllocType = ConstantInt::get(HexTypeUtilSet->Int32Ty, REINTERPRET);
++        Value *TmpOne = ConstantInt::get(HexTypeUtilSet->Int64Ty, 1);
++        Value *Param[2] = {AllocType, TmpOne};
++        Builder.CreateCall(ObjUpdateFunction, Param);
++      }
++    }
++
++    void extendClangInstrumentation(Module &M) {
++      for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F)
++        for (Function::iterator BB = F->begin(), E = F->end(); BB != E;) {
++          bool isUpdated = false;
++          for (BasicBlock::iterator i = BB->begin(), ie = BB->end();
++               i != ie; ++i)
++            if (CallInst *call = dyn_cast<CallInst>(&*i))
++              if (call->getCalledFunction() != nullptr) {
++                std::string FnName = call->getCalledFunction()->getName();
++                if (FnName.compare("__placement_new_handle") == 0 ||
++                    FnName.compare("__reinterpret_casting_handle") == 0) {
++                  if (HexTypeUtilSet->AllTypeInfo.size() > 0) {
++                    if (FnName.compare("__placement_new_handle") == 0)
++                      emitExtendObjTraceInst(M, 1, call, PLACEMENTNEW);
++                    else if (FnName.compare("__reinterpret_casting_handle") == 0)
++                      emitExtendObjTraceInst(M, 1, call, REINTERPRET);
++                  }
++                  (&*i)->eraseFromParent();
++                  isUpdated = true;
++                  break;
++                }
++              }
++          if(isUpdated == false)
++            BB++;
++        }
++    }
++
++    void emitTypeInfoAsGlobalVal(Module &M) {
++      std::string mname = M.getName();
++      HexTypeUtilSet->syncModuleName(mname);
++
++      char ParentSetGlobalValName[MAXLEN];
++      char PhantomSetGlobalValName[MAXLEN];
++
++      strcpy(ParentSetGlobalValName, mname.c_str());
++      strcat(ParentSetGlobalValName, ".cinfo");
++
++      HexTypeUtilSet->typeInfoArrayGlobal =
++        HexTypeUtilSet->emitAsGlobalVal(M, ParentSetGlobalValName,
++                        &(HexTypeUtilSet->typeInfoArray));
++
++      strcpy(PhantomSetGlobalValName, mname.c_str());
++      strcat(PhantomSetGlobalValName, "phantom.cinfo");
++
++      HexTypeUtilSet->typePhantomInfoArrayGlobal =
++        HexTypeUtilSet->emitAsGlobalVal(M, PhantomSetGlobalValName,
++                        &HexTypeUtilSet->typePhantomInfoArray);
++
++      emitPhantomTypeInfo(M);
++    }
++
++    bool isAllocCall(CallInst *val) {
++      if (isAllocationFn(val, this->tli) &&
++          (isMallocLikeFn(val, this->tli) || isCallocLikeFn(val, this->tli) ||
++           !isAllocLikeFn(val, this->tli)))
++        return true;
++      return false;
++    }
++
++    void collectHeapAlloc(CallInst *call,
++                        std::map<CallInst *, Type *> *heapObjsNew) {
++      std::string functionName;
++      if (call->getCalledFunction() != nullptr)
++        functionName.assign(call->getCalledFunction()->getName());
++
++      int unmangledStatus;
++      char *unmangledName =
++        abi::__cxa_demangle(functionName.c_str(), nullptr,
++                            nullptr, &unmangledStatus);
++      bool isOverloadedNew = false;
++      if (unmangledStatus == 0) {
++        std::string unmangledNameStr(unmangledName);
++        if (unmangledNameStr.find("::operator new(unsigned long)") !=
++            std::string::npos ||
++            unmangledNameStr.find(
++              "::operator new(unsigned long, std::nothrow_t const&)") !=
++            std::string::npos ||
++            unmangledNameStr.find("::operator new[](unsigned long)") !=
++            std::string::npos ||
++            unmangledNameStr.find(
++              "::operator new[](unsigned long, std::nothrow_t const&)")
++            != std::string::npos) {
++          isOverloadedNew = true;
++        }
++      }
++
++      if (isAllocCall(call) || isOverloadedNew)
++        if (Type *allocTy = getMallocAllocatedType(call, this->tli))
++          if (HexTypeUtilSet->isInterestingType(allocTy))
++            heapObjsNew->insert(
++              std::pair<CallInst *, Type *>(call, allocTy));
++
++      return;
++    }
++
++    void collectFree(CallInst *call, Instruction *InstPrev,
++                   std::map<CallInst *, Type *> *heapObjsFree) {
++      if (isFreeCall(call, this->tli))
++        if (const BitCastInst *BCI = dyn_cast<BitCastInst>(InstPrev))
++          if (PointerType *FreeType =
++              cast<PointerType>(BCI->getSrcTy())) {
++            Type *VTy = FreeType->getElementType();
++            if (HexTypeUtilSet->isInterestingType(VTy))
++                heapObjsFree->insert(
++                  std::pair<CallInst *, Type *>(call, VTy));
++          }
++
++      return;
++    }
++
++    bool isReallocFn(Function *F) {
++      std::string funName = F->getName().str();
++      if ((funName.find("realloc") != std::string::npos))
++        return true;
++
++      return false;
++    }
++
++    void handleHeapAlloc(Module &M, std::map<CallInst *, Type *> *heapObjsNew) {
++      for (std::map<CallInst *, Type *>::iterator it=heapObjsNew->begin();
++           it!=heapObjsNew->end(); ++it) {
++
++        Instruction *next = HexTypeUtilSet->findNextInstruction(it->first);
++        IRBuilder<> Builder(next);
++
++        bool isRealloc = 0;
++
++        StructElementInfoTy offsets;
++        HexTypeUtilSet->getArrayOffsets(it->second, offsets, 0);
++        if (offsets.size() == 0) continue;
++
++        Value *ArraySize;
++        Value *TypeSize;
++        Value *ArraySizeF = nullptr;
++        if (isMallocLikeFn(it->first, this->tli) ||
++            !isAllocLikeFn(it->first, this->tli) ||
++            !isAllocationFn(it->first, this->tli)) {
++          if (isMallocLikeFn(it->first, this->tli) ||
++              !isAllocationFn(it->first, this->tli))
++            ArraySize = it->first->getArgOperand(0);
++          else
++            ArraySize = it->first->getArgOperand(1);
++
++          unsigned long TypeSizeVal =
++            HexTypeUtilSet->DL.getTypeAllocSize(it->second);
++          TypeSize = ConstantInt::get(HexTypeUtilSet->Int64Ty, TypeSizeVal);
++
++          if (TypeSizeVal != 0)
++            ArraySizeF = Builder.CreateUDiv(ArraySize, TypeSize);
++          else
++            ArraySizeF = ArraySize;
++
++          if (isReallocFn(it->first->getCalledFunction()))
++            isRealloc = true;
++        }
++
++        else if (isCallocLikeFn(it->first, this->tli))
++          ArraySizeF = it->first->getArgOperand(1);
++
++        if (ArraySizeF) {
++          if (isRealloc == 1)
++            HexTypeUtilSet->insertUpdate(&M, Builder, "__update_realloc_oinfo",
++                                         (Value *)(it->first), offsets,
++                                         HexTypeUtilSet->DL.getTypeAllocSize(
++                                           it->second), ArraySizeF,
++                                         (Value *)(it->first->getArgOperand(0)),
++                                         NULL);
++
++          else
++            HexTypeUtilSet->insertUpdate(&M, Builder, "__update_heap_oinfo",
++                                         (Value *)(it->first), offsets,
++                                         HexTypeUtilSet->DL.getTypeAllocSize(
++                                           it->second), ArraySizeF,
++                                         NULL, NULL);
++        }
++      }
++    }
++
++    void handleFree(Module &M, std::map<CallInst *, Type *> *heapObjsFree) {
++      for (std::map<CallInst *, Type *>::iterator it=heapObjsFree->begin();
++           it!=heapObjsFree->end(); ++it) {
++        Instruction *next = HexTypeUtilSet->findNextInstruction(it->first);
++        IRBuilder<> Builder(next);
++        StructElementInfoTy offsets;
++        HexTypeUtilSet->getArrayOffsets(it->second, offsets, 0);
++        HexTypeUtilSet->insertRemove(&M, Builder, "__remove_heap_oinfo",
++                                     it->first->getArgOperand(0), offsets,
++                                     0, HexTypeUtilSet->DL.getTypeAllocSize(
++                                       it->second),
++                                     NULL);
++      }
++    }
++
++    void heapObjTracing(Module &M) {
++      Instruction *InstPrev;
++      this->tli = new TargetLibraryInfo(tlii);
++      std::map<CallInst *, Type *> heapObjsFree, heapObjsNew;
++      for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F)
++        for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
++          for (BasicBlock::iterator i = BB->begin(),
++               ie = BB->end(); i != ie; ++i) {
++            if (CallInst *call = dyn_cast<CallInst>(&*i)) {
++              collectHeapAlloc(call, &heapObjsNew);
++              collectFree(call, InstPrev, &heapObjsFree);
++            }
++            InstPrev = &*i;
++          }
++
++          handleHeapAlloc(M, &heapObjsNew);
++          handleFree(M, &heapObjsFree);
++
++          heapObjsFree.clear();
++          heapObjsNew.clear();
++        }
++    }
++
++    bool isLocalPointer(Value *target, Module::iterator F) {
++      for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB)
++        for (BasicBlock::iterator t = BB->begin(), te = BB->end();
++             t != te; ++t)
++          if (target == dyn_cast<AllocaInst>(&*t))
++            return true;
++
++      return false;
++    }
++
++    bool isSafePointer(Value *target, Module::iterator F, Module *M) {
++      if (!isLocalPointer(target, F))
++        return false;
++
++      for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB)
++        for (BasicBlock::iterator t = BB->begin(), te = BB->end();
++             t != te; ++t)
++          if (StoreInst *AI = dyn_cast<StoreInst>(&*t))
++            if (target == AI->getPointerOperand())
++              if (!isSafeSrcValue(AI->getValueOperand(), F, M))
++                return false;
++
++      return true;
++    }
++
++    bool isHeapObj(CallInst *call) {
++      bool isOverloadedNew = false;
++      std::string functionName = "";
++      if (call->getCalledFunction() != nullptr)
++        functionName = call->getCalledFunction()->getName();
++
++      this->tli = new TargetLibraryInfo(tlii);
++      int unmangledStatus;
++      char *unmangledName =
++        abi::__cxa_demangle(functionName.c_str(), nullptr,
++                            nullptr, &unmangledStatus);
++      if (unmangledStatus == 0) {
++        std::string unmangledNameStr(unmangledName);
++        if (unmangledNameStr.find("::operator new(unsigned long)") !=
++            std::string::npos ||
++            unmangledNameStr.find(
++              "::operator new(unsigned long, std::nothrow_t const&)") !=
++            std::string::npos ||
++            unmangledNameStr.find("::operator new[](unsigned long)") !=
++            std::string::npos ||
++            unmangledNameStr.find(
++              "::operator new[](unsigned long, std::nothrow_t const&)")
++            != std::string::npos) {
++          isOverloadedNew = true;
++        }
++      }
++
++      if (isAllocCall(call) || isOverloadedNew)
++        if (Type *allocTy = getMallocAllocatedType(call, this->tli))
++          if (HexTypeUtilSet->isInterestingType(allocTy))
++            return true;
++
++      return false;
++    }
++
++    bool isSafeSrcValue(Value *SrcValue, Module::iterator F,
++                     Module *M) {
++      // source is global variable
++      for (llvm::Module::global_iterator ii = M->global_begin();
++           ii != M->global_end(); ++ii) {
++        if (&*ii == SrcValue)
++          return true;
++      }
++
++      for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB)
++        for (BasicBlock::iterator t = BB->begin(), te = BB->end();
++             t != te; ++t) {
++          if (SrcValue == (&*t)) {
++            // source type is local stack value
++            if (AllocaInst *AI = dyn_cast<AllocaInst>(&*t)) {
++              if (HexTypeUtilSet->isInterestingType(AI->getAllocatedType()) &&
++                  isa<StructType>(AI->getAllocatedType()))
++                return true;
++
++              else if(AI->getAllocatedType()->isPointerTy())
++                if(isSafePointer(AI, F, M))
++                  return true;
++              return false;
++            }
++
++            // source type is heap object
++            CallInst *call = dyn_cast<CallInst>(&*t);
++            if (call) {
++              if (isHeapObj(call))
++                return true;
++              return false;
++            }
++
++            // if source type is array (not pointer)
++            if (GEPOperator *GO = dyn_cast<GEPOperator>(&*t))
++              if (isa<StructType>(GO->getResultElementType()))
++                return true;
++
++            // if source type is pointer
++            if (LoadInst *AI = dyn_cast<LoadInst>(&*t))
++              if (isSafePointer(AI->getPointerOperand(), F, M))
++                return true;
++
++            // check store instruction
++            if (StoreInst *AI = dyn_cast<StoreInst>(&*t))
++              if (isSafeSrcValue(AI->getValueOperand(), F, M))
++                return true;
++
++            // if source type is related to bitcast
++            if (const BitCastInst *BCI = dyn_cast<BitCastInst>(&*t))
++              if (isSafeSrcValue(BCI->getOperand(0), F, M))
++                return true;
++          }
++        }
++
++      return false;
++    }
++
++    bool compiletime_verification(Value *SrcValue, Module::iterator F,
++                                  Module *M) {
++      if (isSafeSrcValue(SrcValue, F, M)) {
++        // PointerType *FreeType = nullptr;
++        // Type *DstTy= nullptr;
++        // compile_time_verification(src, dst);
++        return true;
++      }
++
++      return false;
++    }
++
++    void compileTimeVerification(Module &M) {
++      for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F)
++        for (Function::iterator BB = F->begin(), E = F->end(); BB != E;) {
++          bool isRemoved = false;
++          for (BasicBlock::iterator i = BB->begin(),
++               ie = BB->end(); i != ie; ++i)
++            if (CallInst *call = dyn_cast<CallInst>(&*i))
++              if (call->getCalledFunction() != nullptr) {
++                std::string functionName = call->getCalledFunction()->getName();
++                if ((functionName.compare("__type_casting_verification") == 0 ||
++                     functionName.compare("__type_casting_verification_changing") == 0))
++                  if (PtrToIntInst *SrcValue =
++                      dyn_cast<PtrToIntInst>(call->getArgOperand(0)))
++                    if (compiletime_verification(SrcValue->getPointerOperand(),
++                                                 F, &M)) {
++                      (&*i)->eraseFromParent();
++                      isRemoved = true;
++                      break;
++                    }
++              }
++
++          if(isRemoved == false)
++            BB++;
++        }
++    }
++
++    void typecastinginlineoptimization(Module &M)  {
++      GlobalVariable* ResultCache = HexTypeUtilSet->getVerifyResultCache(M);
++      GlobalVariable* GObjTypeMap = HexTypeUtilSet->getObjTypeMap(M);
++      for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F)
++        for (Function::iterator BB = F->begin(),
++             E = F->end(); BB != E;) {
++          bool update = false;
++          for (BasicBlock::iterator i = BB->begin(),
++               ie = BB->end(); i != ie; ++i)
++            if (CallInst *call = dyn_cast<CallInst>(&*i)) {
++              if (call->getCalledFunction() != nullptr) {
++                std::string functionName = call->getCalledFunction()->getName();
++                if (functionName.compare("__type_casting_verification") == 0) {
++                  update = true;
++                  Instruction *next = HexTypeUtilSet->findNextInstruction(call);
++                  IRBuilder<> Builder(next);
++                  // (3-0) check whether src addr is NULL
++                  Value* isNotNull =
++                    Builder.CreateIsNotNull(call->getArgOperand(0));
++                  Instruction *InsertPtMain = &*Builder.GetInsertPoint();
++                  TerminatorInst *ThenTermNotNull, *ElseTermNotNull;
++                  SplitBlockAndInsertIfThenElse(isNotNull,
++                                                InsertPtMain, &ThenTermNotNull,
++                                                &ElseTermNotNull, nullptr);
++
++                  // (3-1) get index using src address
++                  Builder.SetInsertPoint(ThenTermNotNull);
++                  Value *newPtr =
++                    Builder.CreatePtrToInt(call->getArgOperand(0),
++                                           HexTypeUtilSet->IntptrTyN);
++                  Value *ptrValueT =
++                    Builder.CreateIntToPtr(newPtr, HexTypeUtilSet->IntptrTyN);
++                  Value *ShVal = Builder.CreateLShr(newPtr, 3);
++                  Value *mapSize =
++                    ConstantInt::get(HexTypeUtilSet->IntptrTyN, 268435455);
++                  Value *mapIndex = Builder.CreateAnd(ShVal, mapSize);
++                  Value *mapIndex64 =
++                    Builder.CreatePtrToInt(mapIndex, HexTypeUtilSet->Int64Ty);
++
++                  // (3-2) access ObjTypeMap using index
++                  Value* ObjTypeMapInit= Builder.CreateLoad(GObjTypeMap);
++                  Value* TargetIndexAddr =
++                    Builder.CreateGEP(ObjTypeMapInit, mapIndex, "");
++                  Value* TargetIndexAddrValueAddr =
++                    Builder.CreateGEP(TargetIndexAddr,
++                                      {ConstantInt::get(
++                                          HexTypeUtilSet->Int32Ty, 0),
++                                      ConstantInt::get(
++                                        HexTypeUtilSet->Int32Ty, 0)}, "");
++
++                  Value* TargetIndexAddrValue =
++                    Builder.CreateLoad(TargetIndexAddrValueAddr);
++                  Value* isEqual = Builder.CreateICmpEQ(ptrValueT,
++                                                        TargetIndexAddrValue);
++                  Instruction *InsertPt = &*Builder.GetInsertPoint();
++                  TerminatorInst *ThenTerm , *ElseTerm ;
++                  SplitBlockAndInsertIfThenElse(isEqual,
++                                                InsertPt, &ThenTerm,
++                                                &ElseTerm, nullptr);
++
++                  // (4) check whether ObjTypeMap[index].addr == src
++                  Builder.SetInsertPoint(ThenTerm);
++                  // (4-1) get src hash value
++                  TargetIndexAddrValueAddr =
++                    Builder.CreateGEP(TargetIndexAddr,
++                                      {ConstantInt::get(
++                                          HexTypeUtilSet->Int32Ty, 0),
++                                      ConstantInt::get(
++                                        HexTypeUtilSet->Int32Ty, 2)}, "");
++                  // (4-2) get index using src and dst Hash Value
++                  TargetIndexAddrValue =
++                    Builder.CreateLoad(TargetIndexAddrValueAddr);
++
++                  // (4-3), (src & 0xfff);
++                  Value *srcIndex =
++                    Builder.CreateBitCast(TargetIndexAddrValue,
++                                          HexTypeUtilSet->Int64Ty);
++                  Value *andValue =
++                    ConstantInt::get(HexTypeUtilSet->Int64Ty, 4095);
++                  Value *leftMapIndex = Builder.CreateAnd(srcIndex, andValue);
++
++                  // (4-4), idxCache <<= 12;
++                  Value *curValue = Builder.CreateShl(leftMapIndex, 12);
++
++                  // (4-5), idxCache |= (dst & 0xfff);
++                  ConstantInt *constantHashValue2 =
++                    dyn_cast<ConstantInt>(call->getArgOperand(1));
++                  Value *dstValue = ConstantInt::get(
++                    HexTypeUtilSet->Int64Ty,
++                    constantHashValue2->getZExtValue());
++                  Value *rightValue = Builder.CreateAnd(dstValue, andValue);
++                  Value *cacheIndex = Builder.CreateOr(curValue, rightValue);
++
++                  // (4-6), verifiedResultCache[idxCache].srcHValue == src &&
++                  //        verifiedResultCache[idxCache].dstHValue == dst
++                  Value* ResultCacheInit = Builder.CreateLoad(ResultCache);
++                  TargetIndexAddr =
++                    Builder.CreateGEP(ResultCacheInit, cacheIndex, "");
++                  Value* TargetIndexAddrValueAddrT =
++                    Builder.CreateGEP(TargetIndexAddr,
++                                      {ConstantInt::get(
++                                          HexTypeUtilSet->Int32Ty, 0),
++                                      ConstantInt::get(
++                                        HexTypeUtilSet->Int32Ty, 0)}, "");
++                  TargetIndexAddrValue =
++                    Builder.CreateLoad(TargetIndexAddrValueAddrT);
++                  Value *srcisEqual =
++                    Builder.CreateICmpEQ(srcIndex, TargetIndexAddrValue);
++                  TargetIndexAddrValueAddrT =
++                    Builder.CreateGEP(TargetIndexAddr,
++                                      {ConstantInt::get(
++                                          HexTypeUtilSet->Int32Ty, 0),
++                                      ConstantInt::get(
++                                        HexTypeUtilSet->Int32Ty, 1)}, "");
++                  TargetIndexAddrValue =
++                    Builder.CreateLoad(TargetIndexAddrValueAddrT);
++                  Value *dstisEqual =
++                    Builder.CreateICmpEQ(dstValue, TargetIndexAddrValue);
++                  llvm::Value *isSatisfied =
++                    Builder.CreateAnd(srcisEqual, dstisEqual);
++                  Instruction *InInsertPt = &*Builder.GetInsertPoint();
++                  TerminatorInst *InThenTerm , *InElseTerm;
++                  SplitBlockAndInsertIfThenElse(isSatisfied,
++                                                InInsertPt, &InThenTerm,
++                                                &InElseTerm, nullptr);
++                  // (4-7) print cache result
++                  Builder.SetInsertPoint(InThenTerm);
++                  Value *GetCacheResult =
++                    Builder.CreateGEP(TargetIndexAddr,
++                                      {ConstantInt::get(
++                                          HexTypeUtilSet->Int32Ty, 0),
++                                      ConstantInt::get(
++                                        HexTypeUtilSet->Int32Ty, 2)}, "");
++                  Value *TargetIndexAddrValueCache =
++                    Builder.CreateLoad(GetCacheResult);
++                  Value *BadCast = ConstantInt::get(HexTypeUtilSet->Int8Ty, 0);
++                  Value *isEqualCacheResult =
++                    Builder.CreateICmpEQ(TargetIndexAddrValueCache, BadCast);
++                  Instruction *InInsertCachePt = &*Builder.GetInsertPoint();
++                  TerminatorInst *InThenCacheTerm , *InElseCacheTerm ;
++
++                  if (ClMakeLogInfo) {
++                    Function *objUpdateFunction =
++                      (Function*)M.getOrInsertFunction(
++                        "__lookup_success_count", HexTypeUtilSet->VoidTy,
++                        HexTypeUtilSet->Int8Ty, nullptr);
++                    Value *Param[1] = { TargetIndexAddrValueCache };
++                    Builder.CreateCall(objUpdateFunction, Param);
++                  }
++
++                  SplitBlockAndInsertIfThenElse(isEqualCacheResult,
++                                                InInsertCachePt,
++                                                &InThenCacheTerm,
++                                                &InElseCacheTerm, nullptr);
++                  Builder.SetInsertPoint(InThenCacheTerm);
++                  Function *initFunction =
++                    (Function*)M.getOrInsertFunction(
++                      "__type_casting_verification_print_cache_result",
++                      HexTypeUtilSet->VoidTy,
++                      HexTypeUtilSet->Int64Ty, nullptr);
++                  Value *ParamTypeCache[1] = { cacheIndex };
++                  Builder.CreateCall(initFunction, ParamTypeCache);
++                  Builder.SetInsertPoint(InInsertCachePt);
++                  Builder.SetInsertPoint(InElseCacheTerm);
++                  Builder.SetInsertPoint(InInsertCachePt);
++                  Builder.SetInsertPoint(InInsertPt);
++                  Builder.SetInsertPoint(InElseTerm);
++                  initFunction =
++                    (Function*)M.getOrInsertFunction(
++                      "__type_casting_verification_inline",
++                      HexTypeUtilSet->VoidTy,
++                      HexTypeUtilSet->Int64Ty,
++                      HexTypeUtilSet->Int64Ty,
++                      HexTypeUtilSet->Int64Ty,
++                      HexTypeUtilSet->Int64Ty,
++                      nullptr);
++                  Value *Param[4] = {srcIndex, dstValue,
++                    mapIndex64, cacheIndex};
++                  Builder.CreateCall(initFunction, Param);
++                  Builder.SetInsertPoint(InInsertPt);
++                  Builder.SetInsertPoint(InsertPt);
++                  Builder.SetInsertPoint(ElseTerm);
++                  // (5) call normal check function
++                  initFunction =
++                    (Function*)M.getOrInsertFunction(
++                      "__type_casting_verification_inline_normal",
++                      HexTypeUtilSet->VoidTy,
++                      HexTypeUtilSet->IntptrTyN,
++                      HexTypeUtilSet->Int64Ty,
++                      nullptr);
++                  Value *Param_elseterm[2] = { newPtr, dstValue };
++                  Builder.CreateCall(initFunction, Param_elseterm);
++                  (&*i)->eraseFromParent();
++                  Builder.SetInsertPoint(InsertPt);
++                  Builder.SetInsertPoint(InsertPtMain);
++                  Builder.SetInsertPoint(ElseTermNotNull);
++                  Builder.SetInsertPoint(InsertPtMain);
++                  break;
++                }
++              }
++            }
++          if(update == false)
++            BB++;
++        }
++    }
++
++    virtual bool runOnModule(Module &M) {
++      // Init HexTypeUtil
++      HexTypeLLVMUtil HexTypeUtilSetT(M.getDataLayout());
++      HexTypeUtilSet = &HexTypeUtilSetT;
++      HexTypeUtilSet->initType(M);
++
++      // Create type releationship information
++      HexTypeUtilSet->createObjRelationInfo(M);
++      if (HexTypeUtilSet->AllTypeInfo.size() > 0)
++        emitTypeInfoAsGlobalVal(M);
++
++      // Init for only tracing casting related objects
++      if (ClCastObjOpt || ClCreateCastRelatedTypeList)
++        HexTypeUtilSet->setCastingRelatedSet();
++      if (ClCreateCastRelatedTypeList)
++        HexTypeUtilSet->extendCastingRelatedTypeSet();
++
++      // Apply typecasting inline optimization
++      if (ClInlineOpt)
++        typecastinginlineoptimization(M);
++
++      // Apply compile time verfication optimization
++      if (ClCompileTimeVerifyOpt)
++        compileTimeVerification(M);
++
++      // Heap object trace
++      heapObjTracing(M);
++
++      // Extend HexType's clang Instrumentation
++      extendClangInstrumentation(M);
++
++      return false;
++    }
++  };
++}
++
++//register pass
++char HexTypeTree::ID = 0;
++
++INITIALIZE_PASS(HexTypeTree, "HexTypeTree",
++                "HexTypePass: fast type safety for C++ programs.",
++                false, false)
++
++ModulePass *llvm::createHexTypeTreePass() {
++  return new HexTypeTree();
++}
+diff --git a/lib/Transforms/Utils/CMakeLists.txt b/lib/Transforms/Utils/CMakeLists.txt
+index 04d2ace..4af46a5 100644
+--- a/lib/Transforms/Utils/CMakeLists.txt
++++ b/lib/Transforms/Utils/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_llvm_library(LLVMTransformUtils
+   LoopVersioning.cpp
+   LowerInvoke.cpp
+   LowerSwitch.cpp
++  HexTypeUtil.cpp
+   Mem2Reg.cpp
+   MemorySSA.cpp
+   MetaRenamer.cpp
+diff --git a/lib/Transforms/Utils/HexTypeUtil.cpp b/lib/Transforms/Utils/HexTypeUtil.cpp
+new file mode 100644
+index 0000000..5d3300f
+--- /dev/null
++++ b/lib/Transforms/Utils/HexTypeUtil.cpp
+@@ -0,0 +1,1160 @@
++//===- HexTypeUtil.cpp - helper functions and classes for HexType ---------===//
++////
++////                     The LLVM Compiler Infrastructure
++////
++//// This file is distributed under the University of Illinois Open Source
++//// License. See LICENSE.TXT for details.
++////
++////===--------------------------------------------------------------------===//
++
++#include "llvm/Pass.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/CallSite.h"
++#include "llvm/IR/InstVisitor.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++
++#include <sys/types.h>
++#include <unistd.h>
++#include <inttypes.h>
++
++#define MAXLEN 1000
++
++namespace llvm {
++  cl::opt<bool> ClCreateCastRelatedTypeList(
++    "create-cast-releated-type-list",
++    cl::desc("create casting related object list"),
++    cl::Hidden, llvm::cl::init(false));
++
++  cl::opt<bool> ClStackOpt(
++    "stack-opt", cl::desc("stack object optimization (from typesan)"),
++    cl::Hidden, cl::init(false));
++
++  cl::opt<bool> ClSafeStackOpt(
++    "safestack-opt",
++    cl::desc("stack object tracing optimization using safestack"),
++    cl::Hidden, cl::init(false));
++
++  cl::opt<bool> ClCastObjOpt(
++    "cast-obj-opt",
++    cl::desc("only casting related object tracing optimization"),
++    cl::Hidden, cl::init(false));
++
++  cl::opt<bool> ClInlineOpt(
++    "inline-opt",
++    cl::desc("reduce runtime library function call overhead"),
++    cl::Hidden, cl::init(false));
++
++  cl::opt<bool> ClCompileTimeVerifyOpt(
++    "compile-time-verify-opt",
++    cl::desc("compile time verification"),
++    cl::Hidden, cl::init(false));
++
++  cl::opt<bool> ClMakeLogInfo(
++    "make-loginfo",
++    cl::desc("create log information"),
++    cl::Hidden, cl::init(false));
++
++  cl::opt<bool> ClMakeTypeInfo(
++    "make-typeinfo",
++    cl::desc("create Type-hash information"),
++    cl::Hidden, cl::init(false));
++
++  uint64_t crc64c(unsigned char *message) {
++    int i, j;
++    unsigned int byte;
++    uint64_t crc, mask;
++    static uint64_t table[256];
++
++    if (table[1] == 0) {
++      for (byte = 0; byte <= 255; byte++) {
++        crc = byte;
++        for (j = 7; j >= 0; j--) {    // Do eight times.
++          mask = -(crc & 1);
++          crc = (crc >> 1) ^ (0xC96C5795D7870F42UL & mask);
++        }
++        table[byte] = crc;
++      }
++    }
++
++    i = 0;
++    crc = 0xFFFFFFFFFFFFFFFFUL;
++    while ((byte = message[i]) != 0) {
++      crc = (crc >> 8) ^ table[(crc ^ byte) & 0xFF];
++      i = i + 1;
++    }
++    return ~crc;
++  }
++
++  void removeTargetStr(std::string& FullStr, std::string RemoveStr) {
++    std::string::size_type i;
++
++    while((i = FullStr.find(RemoveStr)) != std::string::npos) {
++      if (RemoveStr.compare("::") == 0)
++        FullStr.erase(FullStr.begin(), FullStr.begin() + i + 2);
++      else
++        FullStr.erase(i, RemoveStr.length());
++    }
++  }
++
++  void removeTargetNum(std::string& TargetStr) {
++    std::string::size_type i;
++    if((i = TargetStr.find(".")) == std::string::npos)
++      return;
++
++    if((i+1 < TargetStr.size()) &&
++       (TargetStr[i+1] >= '0' && TargetStr[i+1] <='9'))
++      TargetStr.erase(i, TargetStr.size() - i);
++  }
++
++  GlobalVariable* HexTypeLLVMUtil::emitAsGlobalVal(Module &M, char *GlobalVarName,
++                                                   std::vector<Constant*> *TargetArray) {
++    ArrayType *InfoArrayType = ArrayType::get(Int64Ty, TargetArray->size());
++    Constant* infoArray = ConstantArray::get(InfoArrayType, *TargetArray);
++    GlobalVariable* infoGlobal =
++      new GlobalVariable(M, InfoArrayType, false,
++                         GlobalVariable::LinkageTypes::ExternalLinkage,
++                         nullptr, GlobalVarName);
++    infoGlobal->setInitializer(infoArray);
++    return infoGlobal;
++  }
++
++  bool HexTypeLLVMUtil::isSafeStackAlloca(AllocaInst *AI) {
++    // Go through all uses of this alloca and check whether all accesses to
++    // the allocated object are statically known to be memory safe and, hence,
++    // the object can be placed on the safe stack.
++
++    SmallPtrSet<const Value *, 16> Visited;
++    SmallVector<const Instruction *, 8> WorkList;
++    WorkList.push_back(AI);
++
++    // A DFS search through all uses of the alloca in bitcasts/PHI/GEPs/etc.
++    while (!WorkList.empty()) {
++      const Instruction *V = WorkList.pop_back_val();
++      for (const Use &UI : V->uses()) {
++        auto I = cast<const Instruction>(UI.getUser());
++        assert(V == UI.get());
++
++        switch (I->getOpcode()) {
++        case Instruction::Load:
++          // Loading from a pointer is safe.
++          break;
++        case Instruction::VAArg:
++          // "va-arg" from a pointer is safe.
++          break;
++        case Instruction::Store:
++          if (V == I->getOperand(0)){
++            //NHB odd exception for libc - lets see if it works
++            if (I->getOperand(1) == AI &&
++               !(AI->getAllocatedType()->isPointerTy()))
++              break;
++            // Stored the pointer - conservatively assume it may be unsafe.
++            return false;
++          }
++          // Storing to the pointee is safe.
++          break;
++        case Instruction::GetElementPtr:
++          // if (!cast<const GetElementPtrInst>(I)->hasAllConstantIndices())
++          // GEP with non-constant indices can lead to memory errors.
++          // This also applies to inbounds GEPs, as the inbounds attribute
++          // represents an assumption that the address is in bounds,
++          // rather than an assertion that it is.
++          // return false;
++
++          // We assume that GEP on static alloca with constant indices
++          // is safe, otherwise a compiler would detect it and
++          // warn during compilation.
++
++          // NHB Todo: this hasn't come up in spec, but it's probably fine
++          if (!isa<const ConstantInt>(AI->getArraySize())) {
++            // However, if the array size itself is not constant, the access
++            // might still be unsafe at runtime.
++            return false;
++          }
++          /* fallthrough */
++        case Instruction::BitCast:
++        case Instruction::IntToPtr:
++        case Instruction::PHI:
++        case Instruction::PtrToInt:
++        case Instruction::Select:
++          // The object can be safe or not, depending on how the result of the
++          // instruction is used.
++          if (Visited.insert(I).second)
++            WorkList.push_back(cast<const Instruction>(I));
++          break;
++
++        case Instruction::Call:
++        case Instruction::Invoke: {
++          // FIXME: add support for memset and memcpy intrinsics.
++          ImmutableCallSite CS(I);
++
++          if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
++            if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
++                II->getIntrinsicID() == Intrinsic::lifetime_end)
++              continue;
++          }
++
++          // LLVM 'nocapture' attribute is only set for arguments
++          // whose address is not stored, passed around, or used in any other
++          // non-trivial way.
++          // We assume that passing a pointer to an object as a 'nocapture'
++          // argument is safe.
++          // FIXME: a more precise solution would require an interprocedural
++          // analysis here, which would look at all uses of an argument inside
++          // the function being called.
++          ImmutableCallSite::arg_iterator B = CS.arg_begin(),
++            E = CS.arg_end();
++          for (ImmutableCallSite::arg_iterator A = B; A != E; ++A)
++            /*NHB mod*/
++            //!CS.doesNotCapture(A - B))
++            if (A->get() == V && V->getType()->isPointerTy()) {
++              // The parameter is not marked 'nocapture' - unsafe.
++              return false;
++            }
++          continue;
++        }
++        default:
++          // The object is unsafe if it is used in any other way.
++          return false;
++        }
++      }
++    }
++
++    // All uses of the alloca are safe, we can place it on the safe stack.
++    return true;
++  }
++
++  void HexTypeLLVMUtil::getTypeInfoFromClang() {
++    if (getenv("HEXTYPE_LOG_PATH") != nullptr) {
++      char path[MAXLEN];
++      strcpy(path, getenv("HEXTYPE_LOG_PATH"));
++      strcat(path, "/typeinfo.txt");
++      FILE *op = fopen(path, "r");
++      if(op != nullptr) {
++        uint64_t FromTy, ToTy;
++        int Type;
++        while(fscanf(op, "%d %" PRIu64 "%" PRIu64 "", &Type, &FromTy, &ToTy) != EOF) {
++          for (uint32_t i=0;i<AllTypeNum;i++)
++            if (AllTypeInfo[i].DetailInfo.TypeHashValue == FromTy) {
++              TypeDetailInfo AddTypeInfo;
++              AddTypeInfo.TypeHashValue = ToTy;
++              AddTypeInfo.TypeIndex = 0;
++              if (Type == 1)
++                AllTypeInfo[i].DirectParents.push_back(AddTypeInfo);
++              if (Type == 2)
++                AllTypeInfo[i].DirectPhantomTypes.push_back(AddTypeInfo);
++            }
++        }
++        fclose(op);
++      }
++    }
++  }
++
++  void HexTypeLLVMUtil::getDirectTypeInfo(Module &M) {
++    std::vector<StructType*> Types = M.getIdentifiedStructTypes();
++    for (StructType *ST : Types) {
++      TypeInfo NewType;
++      if (!HexTypeCommonUtil::isInterestingStructType(ST))
++        continue;
++
++      if (!ST->getName().startswith("trackedtype.") ||
++          ST->getName().endswith(".base"))
++        continue;
++
++      if (ST->getName().startswith("struct.VerifyResultCache") ||
++          ST->getName().startswith("struct.ObjTypeMap"))
++        continue;
++
++      parsingTypeInfo(ST, NewType, AllTypeNum++);
++      AllTypeInfo.push_back(NewType);
++    }
++
++    getTypeInfoFromClang();
++  }
++
++  bool HexTypeLLVMUtil::isInterestingFn(Function *F) {
++    if (F->empty() || F->getEntryBlock().empty() ||
++        F->getName().startswith("__init_global_object"))
++      return false;
++
++    return true;
++  }
++
++  void HexTypeLLVMUtil::extendPhantomSet(int TargetIndex, int CurrentIndex) {
++    if (VisitCheck[CurrentIndex] == true)
++      return;
++
++    VisitCheck[CurrentIndex] = true;
++
++    AllTypeInfo[TargetIndex].AllPhantomTypes.push_back(
++      AllTypeInfo[CurrentIndex].DetailInfo);
++    TypeInfo* ParentNode = &AllTypeInfo[CurrentIndex];
++
++    for (uint32_t i=0;i<ParentNode->DirectPhantomTypes.size();i++)
++      extendPhantomSet(TargetIndex,
++                       ParentNode->DirectPhantomTypes[i].TypeIndex);
++    return;
++  }
++
++  void HexTypeLLVMUtil::emitRemoveInst(Module *SrcM, IRBuilder<> &BuilderAI,
++                                   AllocaInst *TargetAlloca) {
++    Value *TypeSize = NULL;
++    if (ConstantInt *constantSize =
++        dyn_cast<ConstantInt>(TargetAlloca->getArraySize()))
++      TypeSize =
++        ConstantInt::get(Int64Ty, constantSize->getZExtValue());
++    else {
++      Value *arraySize = TargetAlloca->getArraySize();
++      if (arraySize->getType() != Int64Ty)
++        TypeSize = BuilderAI.CreateIntCast(arraySize, Int64Ty, false);
++      else
++        TypeSize = arraySize;
++    }
++
++    StructElementInfoTy Elements;
++    Type *AllocaType = TargetAlloca->getAllocatedType();
++    getArrayOffsets(AllocaType, Elements, 0);
++    if (Elements.size() == 0) return;
++
++    insertRemove(SrcM, BuilderAI, "__remove_stack_oinfo", TargetAlloca,
++                 Elements, TypeSize, DL.getTypeAllocSize(AllocaType), NULL);
++  }
++
++  void HexTypeLLVMUtil::extendParentSet(int TargetIndex, int CurrentIndex) {
++    if (VisitCheck[CurrentIndex] == true)
++      return;
++
++    VisitCheck[CurrentIndex] = true;
++
++    AllTypeInfo[TargetIndex].AllParents.push_back(
++      AllTypeInfo[CurrentIndex].DetailInfo);
++    TypeInfo* ParentNode = &AllTypeInfo[CurrentIndex];
++
++    for (uint32_t i=0;i<ParentNode->DirectParents.size();i++)
++      extendParentSet(TargetIndex, ParentNode->DirectParents[i].TypeIndex);
++
++    for (uint32_t i=0;i<ParentNode->DirectPhantomTypes.size();i++)
++       extendParentSet(TargetIndex,
++                     ParentNode->DirectPhantomTypes[i].TypeIndex);
++    return;
++  }
++
++  void HexTypeLLVMUtil::extendTypeRelationInfo() {
++    for (uint32_t i=0;i<AllTypeNum;i++)
++      for (uint32_t j=0;j<AllTypeInfo[i].DirectParents.size();j++)
++        for (uint32_t t=0;t<AllTypeNum;t++)
++          if (i != t &&
++              (AllTypeInfo[i].DirectParents[j].TypeHashValue ==
++               AllTypeInfo[t].DetailInfo.TypeHashValue)) {
++            AllTypeInfo[i].DirectParents[j].TypeIndex = t;
++
++            if (DL.getTypeAllocSize(AllTypeInfo[i].StructTy) ==
++                DL.getTypeAllocSize(AllTypeInfo[t].StructTy)) {
++              AllTypeInfo[i].DirectPhantomTypes.push_back(
++                AllTypeInfo[t].DetailInfo);
++              AllTypeInfo[t].DirectPhantomTypes.push_back(
++                AllTypeInfo[i].DetailInfo);
++            }
++          }
++
++    for (uint32_t i=0;i<AllTypeNum;i++) {
++      std::fill_n(VisitCheck, AllTypeNum, false);
++      extendParentSet(i, i);
++
++      std::fill_n(VisitCheck, AllTypeNum, false);
++      extendPhantomSet(i, i);
++    }
++  }
++
++  void HexTypeLLVMUtil::sortSet(std::set<uint64_t> &TargetSet) {
++    std::vector<uint64_t> tmpSort;
++    for (std::set<uint64_t>::iterator it=TargetSet.begin();
++         it!=TargetSet.end(); ++it)
++      tmpSort.push_back(*it);
++    sort(tmpSort.begin(), tmpSort.end());
++
++    TargetSet.clear();
++    for(size_t i=0; i<tmpSort.size(); i++)
++      TargetSet.insert(tmpSort[i]);
++  }
++
++  void HexTypeLLVMUtil::getSortedAllParentSet() {
++    typeInfoArray.push_back(ConstantInt::get(Int64Ty,
++                                             AllTypeNum));
++    typeInfoArrayInt.push_back(AllTypeNum);
++    for (uint32_t i=0;i<AllTypeNum;i++) {
++      typeInfoArray.push_back(
++        ConstantInt::get(Int64Ty,
++                         AllTypeInfo[i].DetailInfo.TypeHashValue));
++
++      typeInfoArrayInt.push_back(AllTypeInfo[i].DetailInfo.TypeHashValue);
++
++      std::set<uint64_t> TmpSet;
++      for (unsigned long j=0;j<AllTypeInfo[i].AllParents.size();j++)
++        TmpSet.insert(AllTypeInfo[i].AllParents[j].TypeHashValue);
++      sortSet(TmpSet);
++
++      typeInfoArray.push_back(
++        ConstantInt::get(Int64Ty, TmpSet.size()));
++      typeInfoArrayInt.push_back(TmpSet.size());
++
++      for (std::set<uint64_t>::iterator it=TmpSet.begin();
++           it!=TmpSet.end(); ++it) {
++        typeInfoArray.push_back(ConstantInt::get(Int64Ty, *it));
++        typeInfoArrayInt.push_back(*it);
++      }
++
++      TmpSet.clear();
++    }
++  }
++
++  void HexTypeLLVMUtil::getSortedAllPhantomSet() {
++    int phantomTypeCnt = 0;
++    for (uint32_t i=0;i<AllTypeNum;i++)
++      if (AllTypeInfo[i].AllPhantomTypes.size() > 1)
++        phantomTypeCnt +=1;
++    typePhantomInfoArray.push_back(
++      ConstantInt::get(Int64Ty, phantomTypeCnt));
++
++    for (uint32_t i=0;i<AllTypeNum;i++) {
++      if (AllTypeInfo[i].AllPhantomTypes.size() <= 1)
++        continue;
++
++      typePhantomInfoArray.push_back(
++        ConstantInt::get(Int64Ty,
++                         AllTypeInfo[i].DetailInfo.TypeHashValue));
++
++      std::set<uint64_t> TmpOnlyPhantomSet;
++      for (unsigned long j=0;j<AllTypeInfo[i].AllPhantomTypes.size();j++)
++        TmpOnlyPhantomSet.insert(
++          AllTypeInfo[i].AllPhantomTypes[j].TypeHashValue);
++
++      sortSet(TmpOnlyPhantomSet);
++      typePhantomInfoArray.push_back(
++        ConstantInt::get(Int64Ty, TmpOnlyPhantomSet.size()));
++
++      for (std::set<uint64_t>::iterator it=TmpOnlyPhantomSet.begin();
++           it!=TmpOnlyPhantomSet.end(); ++it)
++        typePhantomInfoArray.push_back(
++          ConstantInt::get(Int64Ty, *it));
++
++      TmpOnlyPhantomSet.clear();
++    }
++  }
++
++  void HexTypeLLVMUtil::setCastingRelatedSet() {
++    if (getenv("HEXTYPE_LOG_PATH") != nullptr) {
++      char path[MAXLEN];
++      strcpy(path, getenv("HEXTYPE_LOG_PATH"));
++      strcat(path, "/casting_obj.txt");
++
++      FILE *op = fopen(path, "r");
++      if(op != nullptr) {
++        char TypeName[MAXLEN];
++        flockfile(op);
++        while(fscanf(op, "%s", TypeName) == 1) {
++          std::string upTypeName(TypeName);
++          CastingRelatedSet.insert(upTypeName);
++        }
++        fclose(op);
++        funlockfile(op);
++      }
++    }
++  }
++
++  void HexTypeLLVMUtil::extendCastingRelatedTypeSet() {
++    for (uint32_t i=0;i<AllTypeNum;i++)
++      for (unsigned long j=0;j<AllTypeInfo[i].AllParents.size();j++)
++        if ((CastingRelatedSet.find(AllTypeInfo[i].AllParents[j].TypeName) !=
++             CastingRelatedSet.end())) {
++          CastingRelatedExtendSet.insert(AllTypeInfo[i].DetailInfo.TypeName);
++          break;
++        }
++
++    std::set<std::string>::iterator it;
++    for (it = CastingRelatedExtendSet.begin();
++         it != CastingRelatedExtendSet.end(); ++it) {
++      if((CastingRelatedSet.find(*it)) == CastingRelatedSet.end()) {
++        char fileName[MAXLEN];
++        char fileNameTmp[MAXLEN];
++        strcpy(fileName, "/casting_obj");
++        sprintf(fileNameTmp,"_%d.txt", getpid());
++        strcat(fileName, fileNameTmp);
++
++        char tmp[MAXLEN];
++        sprintf(tmp, "%s", (*it).c_str());
++        writeInfoToFile(tmp, fileName);
++        CastingRelatedSet.insert((*it));
++      }
++    }
++  }
++
++  void HexTypeLLVMUtil::createObjRelationInfo(Module &M) {
++    getDirectTypeInfo(M);
++    if (AllTypeInfo.size() == 0)
++      return;
++    extendTypeRelationInfo();
++    getSortedAllParentSet();
++    getSortedAllPhantomSet();
++  }
++
++  void HexTypeLLVMUtil::initType(Module &M) {
++    LLVMContext& Ctx = M.getContext();
++
++    VoidTy = Type::getVoidTy(Ctx);
++    Int8PtrTy = PointerType::getUnqual(Type::getInt8Ty(Ctx));
++    Int32PtrTy = PointerType::getUnqual(Type::getInt32Ty(Ctx));
++    Int64PtrTy = PointerType::getUnqual(Type::getInt64Ty(Ctx));
++    IntptrTy = Type::getInt8PtrTy(Ctx);
++    IntptrTyN = DL.getIntPtrType(Ctx);
++    Int128Ty = Type::getInt128Ty(Ctx);
++    Int64Ty = Type::getInt64Ty(Ctx);
++    Int32Ty = Type::getInt32Ty(Ctx);
++    Int8Ty = Type::getInt8Ty(Ctx);
++    Int1Ty = Type::getInt1Ty(Ctx);
++  }
++
++  void HexTypeCommonUtil::writeInfoToFile(char *Info, char *FilePath) {
++    assert(Info && "Invalid information");
++    assert(FilePath && "Invalid filepath");
++    if ((Info != NULL) && getenv("HEXTYPE_LOG_PATH") != nullptr) {
++      char path[MAXLEN];
++      strcpy(path, getenv("HEXTYPE_LOG_PATH"));
++      strcat(path, FilePath);
++
++      FILE *op = fopen(path, "a");
++      if (op) {
++        fprintf(op, "%s\n", Info);
++        fflush(op);
++        fclose(op);
++      }
++    }
++  }
++
++  void HexTypeCommonUtil::updateCastingReleatedTypeIntoFile(Type *SrcTy) {
++    if(SrcTy->isPointerTy()) {
++      llvm::PointerType *ptr = cast<llvm::PointerType>(SrcTy);
++      if(llvm::Type *AggTy = ptr->getElementType())
++        if(AggTy->isStructTy()) {
++          char fileName[MAXLEN];
++          char fileNameTmp[MAXLEN];
++          strcpy(fileName, "/casting_obj_init");
++          sprintf(fileNameTmp,"_%d.txt", getpid());
++          strcat(fileName, fileNameTmp);
++
++          char tmp[MAXLEN];
++          std::string TypeName(AggTy->getStructName().str());
++          syncTypeName(TypeName);
++          sprintf(tmp, "%s", TypeName.c_str());
++          writeInfoToFile(tmp, fileName);
++        }
++    }
++  }
++
++  void HexTypeCommonUtil::syncTypeName(std::string& TargetStr) {
++    SmallVector<std::string, 12> RemoveStrs;
++    RemoveStrs.push_back("::");
++    RemoveStrs.push_back("class.");
++    RemoveStrs.push_back("./");
++    RemoveStrs.push_back("struct.");
++    RemoveStrs.push_back("union.");
++    RemoveStrs.push_back(".base");
++    RemoveStrs.push_back("trackedtype.");
++    RemoveStrs.push_back("blacklistedtype.");
++    RemoveStrs.push_back("*");
++    RemoveStrs.push_back("'");
++
++    for (unsigned long i=0; i<RemoveStrs.size(); i++)
++      removeTargetStr(TargetStr, RemoveStrs[i]);
++    removeTargetNum(TargetStr);
++  }
++
++  Instruction* HexTypeLLVMUtil::findNextInstruction(Instruction *CurInst) {
++    BasicBlock::iterator it(CurInst);
++    ++it;
++    if (it == CurInst->getParent()->end())
++      return NULL;
++
++    return &*it;
++  }
++
++  void HexTypeLLVMUtil::getArrayOffsets(Type *AI, StructElementInfoTy &Elements,
++                                    uint32_t Offset) {
++    if (ArrayType *Array = dyn_cast<ArrayType>(AI)) {
++      uint32_t ArraySize = Array->getNumElements();
++      Type *AllocaType = Array->getElementType();
++      for (uint32_t i = 0; i < ArraySize ; i++) {
++        getArrayOffsets(AllocaType, Elements,
++                        (Offset + (i * DL.getTypeAllocSize(AllocaType))));
++      }
++    }
++
++    else if (StructType *STy = dyn_cast<StructType>(AI))
++      if (isInterestingStructType(STy))
++        HexTypeLLVMUtil::getStructOffsets(STy, Elements, Offset);
++  }
++
++  void HexTypeLLVMUtil::getStructOffsets(StructType *STy,
++                                     StructElementInfoTy &Elements,
++                                     uint32_t Offset) {
++    const StructLayout *SL = DL.getStructLayout(STy);
++    bool duplicate = false;
++
++    for (std::list<std::pair<uint64_t, StructType*>>::iterator it =
++         Elements.begin(); it != Elements.end(); it++)
++      if (Offset == it->first) {
++        duplicate = true;
++        break;
++      }
++
++    if (!duplicate)
++      if (STy->getName().startswith("trackedtype."))
++        Elements.push_back(std::make_pair(Offset, STy));
++
++    for (unsigned i = 0, e = STy->getNumElements(); i != e; ++i) {
++      uint32_t tmp = SL->getElementOffset(i) + Offset;
++      HexTypeLLVMUtil::getArrayOffsets(STy->getElementType(i), Elements, tmp);
++    }
++  }
++
++  void HexTypeLLVMUtil::removeNonCastingRelatedObj(StructElementInfoTy &Elements) {
++    bool FindType = true;
++    while (FindType && Elements.size() > 0) {
++      FindType = false;
++      std::list<std::pair<uint64_t, StructType*>>::iterator it1;
++      it1 = Elements.begin();
++
++      for (auto &entry : Elements) {
++        assert(entry.second != nullptr);
++        assert(entry.second->hasName());
++
++        std::string TargetStr = entry.second->getName();
++        syncTypeName(TargetStr);
++        if ((CastingRelatedSet.find(TargetStr)) == CastingRelatedSet.end()) {
++          Elements.erase(it1);
++          FindType = true;
++          break;
++        }
++        it1++;
++      }
++    }
++  }
++
++  GlobalVariable *HexTypeLLVMUtil::getVerifyResultCache(Module &M) {
++    llvm::SmallString<32> ResultCacheTyName("struct.VerifyResultCache");
++    llvm::Type *FieldTypes[] = {
++      Int64Ty,
++      Int64Ty,
++      Int8Ty };
++    llvm::StructType *ResultCacheTy =
++      llvm::StructType::create(M.getContext(),
++                               FieldTypes, ResultCacheTyName);
++    PointerType* ResultCacheTyP = PointerType::get(ResultCacheTy, 0);
++    GlobalVariable* ResultCache =
++      M.getGlobalVariable("VerifyResultCache", true);
++
++    if (!ResultCache) {
++      ResultCache =
++        new GlobalVariable(M,
++                           ResultCacheTyP,
++                           false,
++                           GlobalValue::ExternalLinkage,
++                           0,
++                           "VerifyResultCache");
++      ResultCache->setAlignment(8);
++    }
++
++    return ResultCache;
++  }
++
++  GlobalVariable *HexTypeLLVMUtil::getObjTypeMap(Module &M) {
++    llvm::SmallString<32> ObjTypeMapName("struct.ObjHaspMap");
++    llvm::Type *FieldTypesObj[] = {
++      IntptrTyN,
++      IntptrTyN,
++      Int64Ty,
++      Int32Ty,
++      Int32Ty,
++      IntptrTyN};
++    llvm::StructType *ObjTypeMapTy =
++      llvm::StructType::create(M.getContext(),
++                               FieldTypesObj, ObjTypeMapName);
++    PointerType* ObjTypeMapTyP = PointerType::get(ObjTypeMapTy, 0);
++    GlobalVariable* GObjTypeMap = M.getGlobalVariable("ObjTypeMap", true);
++    if (!GObjTypeMap) {
++      GObjTypeMap =
++        new GlobalVariable(M,
++                           ObjTypeMapTyP,
++                           false,
++                           GlobalValue::ExternalLinkage,
++                           0,
++                           "ObjTypeMap");
++      GObjTypeMap->setAlignment(8);
++    }
++
++    return GObjTypeMap;
++  }
++
++  void HexTypeLLVMUtil::emitInstForObjTrace(Module *SrcM, IRBuilder<> &Builder,
++                                            StructElementInfoTy &Elements,
++                                            uint32_t EmitType,
++                                            Value *ObjAddr, Value *ArraySize,
++                                            uint32_t TypeSizeInt,
++                                            uint32_t CurrArrayIndex,
++                                            uint32_t AllocType,
++                                            Value *ReallocAddr,
++                                            BasicBlock* BasicBlock) {
++    if (ClCastObjOpt && (AllocType != PLACEMENTNEW) &&
++        (AllocType != REINTERPRET)) {
++      removeNonCastingRelatedObj(Elements);
++      if (Elements.size() == 0) return;
++    }
++
++    if (ObjAddr && ObjAddr->getType()->isPtrOrPtrVectorTy())
++      ObjAddr = Builder.CreatePointerCast(ObjAddr, Int64PtrTy);
++
++    if (ReallocAddr && ReallocAddr->getType()->isPtrOrPtrVectorTy())
++      ReallocAddr = Builder.CreatePointerCast(ReallocAddr, Int64PtrTy);
++
++    Value *TypeSize = ConstantInt::get(Int32Ty, TypeSizeInt);
++    ConstantInt *constantTypeSize = dyn_cast<ConstantInt>(TypeSize);
++
++    bool isFristEntry = true;
++    for (auto &entry : Elements) {
++      uint32_t OffsetInt;
++      if (AllocType == PLACEMENTNEW || AllocType == REINTERPRET)
++        OffsetInt = 0;
++      else
++        OffsetInt = entry.first;
++      Value *OffsetV = ConstantInt::get(Int32Ty, OffsetInt);
++      OffsetInt += (constantTypeSize->getZExtValue() * CurrArrayIndex);
++      Value *first = ConstantInt::get(IntptrTyN, OffsetInt);
++      Value *second = Builder.CreatePtrToInt(ObjAddr, IntptrTyN);
++      Value *NewAddr = Builder.CreateAdd(first, second);
++      Value *ObjAddrT = Builder.CreateIntToPtr(NewAddr, IntptrTyN);
++
++      uint64_t TypeHashValueInt;
++      if (AllocType == PLACEMENTNEW || AllocType == REINTERPRET)
++        TypeHashValueInt = entry.first;
++      else
++        TypeHashValueInt = getHashValueFromSTy(entry.second);
++      Value *TypeHashValue = ConstantInt::get(Int64Ty, TypeHashValueInt);
++      Value *AllocTypeV = ConstantInt::get(Int32Ty, AllocType);
++      Value *RuleAddr = nullptr;
++      if (EmitType != CONOBJDEL && EmitType != VLAOBJDEL) {
++        uint64_t pos = 1;
++        for (uint64_t i = 0 ; i < typeInfoArrayInt.at(0); i++) {
++          if (typeInfoArrayInt.at(pos++) == TypeHashValueInt)
++            break;
++          uint64_t interSize = typeInfoArrayInt.at(pos);
++          pos += (interSize + 1);
++        }
++        Value *first = ConstantInt::get(IntptrTyN, (pos * sizeof(uint64_t)));
++        Value *second = Builder.CreatePtrToInt(typeInfoArrayGlobal, IntptrTyN);
++        RuleAddr = Builder.CreateIntToPtr(Builder.CreateAdd(first, second),
++                                          IntptrTyN);
++      }
++
++      // apply Inline optimization
++      Value *mapIndex;
++      Value *isNull, *isEqual;
++      Value *TargetIndexAddr;
++      Value *TargetIndexAddrValue;
++      Value *mapIndex64;
++
++      static GlobalVariable* GObjTypeMap;
++      if (ClInlineOpt && (EmitType == CONOBJADD || EmitType == CONOBJDEL) &&
++          (AllocType != REINTERPRET && AllocType != GLOBALALLOC)) {
++        GObjTypeMap = getObjTypeMap(*SrcM);
++
++        // create hashmap index
++        Value *ShVal = Builder.CreateLShr(NewAddr, 3);
++        Value *mapSize = ConstantInt::get(IntptrTyN, 268435455);
++        mapIndex = Builder.CreateAnd(ShVal, mapSize);
++        mapIndex64 = Builder.CreatePtrToInt(mapIndex, Int64Ty);
++
++        // get value from the ObjTypeMap table using index
++        Value* ObjTypeMapInit = Builder.CreateLoad(GObjTypeMap);
++        TargetIndexAddr = Builder.CreateGEP(ObjTypeMapInit, mapIndex, "");
++
++        // Load index
++        Value* TargetIndexAddrValueAddr =
++          Builder.CreateGEP(TargetIndexAddr, {ConstantInt::get(Int32Ty, 0),
++                            ConstantInt::get(Int32Ty, 0)}, "");
++        TargetIndexAddrValue =
++          Builder.CreateLoad(TargetIndexAddrValueAddr);
++        isEqual = Builder.CreateICmpEQ(ObjAddrT, TargetIndexAddrValue);
++      }
++
++      switch (EmitType) {
++      case CONOBJADD :
++        {
++          if (ClInlineOpt &&
++              AllocType != REINTERPRET &&
++              AllocType != GLOBALALLOC) {
++            isNull = Builder.CreateIsNull(TargetIndexAddrValue);
++            llvm::Value *isNullandEqual = Builder.CreateOr(isNull, isEqual);
++            Instruction *InsertPt = &*Builder.GetInsertPoint();
++            TerminatorInst *ThenTerm, *ElseTerm;
++            SplitBlockAndInsertIfThenElse(isNullandEqual,
++                                          InsertPt, &ThenTerm,
++                                          &ElseTerm, nullptr);
++            // if ObjTypeMap[index] is empty
++            Builder.SetInsertPoint(ThenTerm);
++            Value* TargetIndexAddrValueAddrT =
++              Builder.CreateGEP(TargetIndexAddr, {ConstantInt::get(Int32Ty, 0),
++                                ConstantInt::get(Int32Ty, 0)}, "");
++            Builder.CreateStore(ObjAddrT, TargetIndexAddrValueAddrT);
++            TargetIndexAddrValueAddrT =
++              Builder.CreateGEP(TargetIndexAddr, {ConstantInt::get(Int32Ty, 0),
++                                ConstantInt::get(Int32Ty, 1)}, "");
++            Builder.CreateStore(RuleAddr, TargetIndexAddrValueAddrT);
++            TargetIndexAddrValueAddrT =
++              Builder.CreateGEP(TargetIndexAddr, {ConstantInt::get(Int32Ty, 0),
++                                ConstantInt::get(Int32Ty, 2)}, "");
++            Builder.CreateStore(TypeHashValue, TargetIndexAddrValueAddrT);
++            TargetIndexAddrValueAddrT =
++              Builder.CreateGEP(TargetIndexAddr, {ConstantInt::get(Int32Ty, 0),
++                                ConstantInt::get(Int32Ty, 4)}, "");
++            Builder.CreateStore(OffsetV, TargetIndexAddrValueAddrT);
++
++            Builder.SetInsertPoint(ElseTerm);
++            Function *initFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__update_direct_oinfo_inline", VoidTy,
++                IntptrTyN, Int64Ty, Int32Ty, IntptrTyN, Int64Ty, nullptr);
++            Value *Param[5] = {ObjAddrT, TypeHashValue, OffsetV,
++              RuleAddr, mapIndex64};
++            Builder.CreateCall(initFunction, Param);
++            Builder.SetInsertPoint(InsertPt);
++          }
++          else {
++            char TargetFn[MAXLEN];
++            if (AllocType == REINTERPRET)
++              strcpy(TargetFn, "__handle_reinterpret_cast");
++            else
++              strcpy(TargetFn, "__update_direct_oinfo");
++
++            Value *Param[4] = {ObjAddrT, TypeHashValue, OffsetV, RuleAddr};
++            Function *initFunction =
++              (Function*)SrcM->getOrInsertFunction(TargetFn,
++                                                   VoidTy, IntptrTyN, Int64Ty,
++                                                   Int32Ty, IntptrTyN, nullptr);
++            Builder.CreateCall(initFunction, Param);
++          }
++          if (ClMakeLogInfo) {
++            Value *AllocTypeV =
++              ConstantInt::get(Int32Ty, AllocType);
++            Function *ObjUpdateFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__obj_update_count", VoidTy,
++                Int32Ty, Int64Ty, nullptr);
++            Value *TmpOne = ConstantInt::get(Int64Ty, 1);
++            Value *Param[2] = {AllocTypeV, TmpOne};
++            Builder.CreateCall(ObjUpdateFunction, Param);
++          }
++          break;
++        }
++      case VLAOBJADD:
++        {
++          if (AllocType == REALLOC) {
++            Value *third = Builder.CreatePtrToInt(ReallocAddr, IntptrTyN);
++            Value *ObjAddrR =
++              Builder.CreateIntToPtr(Builder.CreateAdd(first, third),
++                                     IntptrTyN);
++            if (isFristEntry) {
++              Function *initFunction =
++                (Function*)SrcM->getOrInsertFunction("__remove_oinfo",
++                                                     VoidTy, IntptrTyN,
++                                                     Int32Ty, Int64Ty,
++                                                     Int32Ty, nullptr);
++              Value *Param[4] = {ObjAddrR, TypeSize, ArraySize, AllocTypeV};
++              Builder.CreateCall(initFunction, Param);
++            }
++          }
++          Function *initFunction =
++            (Function*)SrcM->getOrInsertFunction("__update_oinfo",
++                                                 VoidTy, IntptrTyN, Int64Ty,
++                                                 Int32Ty, Int32Ty,
++                                                 Int64Ty, IntptrTyN, nullptr);
++          Value *ParamVLAADD[6] = {ObjAddrT, TypeHashValue, OffsetV,
++            TypeSize, ArraySize, RuleAddr};
++          Builder.CreateCall(initFunction, ParamVLAADD);
++          if (ClMakeLogInfo) {
++            Value *AllocTypeV =
++              ConstantInt::get(Int32Ty, AllocType);
++            Function *ObjUpdateFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__obj_update_count", VoidTy,
++                Int32Ty, Int64Ty, nullptr);
++            Value *Param[2] = {AllocTypeV, ArraySize};
++            Builder.CreateCall(ObjUpdateFunction, Param);
++          }
++          break;
++        }
++      case CONOBJDEL:
++        {
++         if (ClInlineOpt) {
++            // Insert if/else statement
++            Instruction *InsertPt = &*Builder.GetInsertPoint();
++            TerminatorInst *ThenTerm, *ElseTerm;
++            SplitBlockAndInsertIfThenElse(isEqual,
++                                          InsertPt, &ThenTerm,
++                                          &ElseTerm, nullptr);
++            // if ObjTypeMap[index].addr is equal
++            Builder.SetInsertPoint(ThenTerm);
++            Value* TargetIndexAddrValueAddrT =
++              Builder.CreateGEP(TargetIndexAddr, {ConstantInt::get(Int32Ty, 0),
++                                ConstantInt::get(Int32Ty, 0)}, "");
++            Builder.CreateStore(Constant::getNullValue(IntptrTyN),
++                                TargetIndexAddrValueAddrT);
++            // if ObjTypeMap[index].addr is not equal, try to remove from RBTree
++            Builder.SetInsertPoint(ElseTerm);
++            Function *initFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__remove_direct_oinfo_inline", VoidTy,
++                IntptrTyN, Int64Ty, nullptr);
++            Value *Param[2] = {ObjAddrT, mapIndex64};
++            Builder.CreateCall(initFunction, Param);
++            Builder.SetInsertPoint(InsertPt);
++          }
++          else {
++            Function *initFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__remove_direct_oinfo", VoidTy,
++                IntptrTyN, nullptr);
++            Value *ParamCONDEL[1] = {ObjAddrT};
++            Builder.CreateCall(initFunction, ParamCONDEL);
++          }
++          if (ClMakeLogInfo) {
++            Value *AllocTypeV =
++              ConstantInt::get(Int32Ty, AllocType);
++            Function *ObjUpdateFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__obj_remove_count", VoidTy,
++                Int32Ty, Int64Ty, nullptr);
++            Value *TmpOne = ConstantInt::get(Int64Ty, 1);
++            Value *Param[2] = {AllocTypeV, TmpOne};
++            Builder.CreateCall(ObjUpdateFunction, Param);
++          }
++          break;
++        }
++      case VLAOBJDEL:
++        {
++          Function *initFunction =
++            (Function*)SrcM->getOrInsertFunction("__remove_oinfo",
++                                                 VoidTy, IntptrTyN,
++                                                 Int32Ty, Int64Ty,
++                                                 Int32Ty, nullptr);
++          Value *ParamVLADEL[4] = {ObjAddrT, TypeSize, ArraySize, AllocTypeV};
++          Builder.CreateCall(initFunction, ParamVLADEL);
++          if (ClMakeLogInfo && AllocType == STACKALLOC) {
++            Value *AllocTypeV =
++              ConstantInt::get(Int32Ty, AllocType);
++            Function *ObjUpdateFunction =
++              (Function*)SrcM->getOrInsertFunction(
++                "__obj_remove_count", VoidTy,
++                Int32Ty, Int64Ty, nullptr);
++            Value *TmpOne = ConstantInt::get(Int64Ty, 1);
++            Value *Param[2] = {AllocTypeV, TmpOne};
++            Builder.CreateCall(ObjUpdateFunction, Param);
++          }
++          break;
++        }
++      }
++      isFristEntry = false;
++    }
++  }
++
++  uint32_t getAllocType(std::string RuntimeFnName) {
++    if (RuntimeFnName.compare("__update_stack_oinfo") == 0 ||
++        RuntimeFnName.compare("__remove_stack_oinfo") == 0)
++      return STACKALLOC;
++    else if (RuntimeFnName.compare("__update_global_oinfo") == 0)
++      return GLOBALALLOC;
++    else if (RuntimeFnName.compare("__update_heap_oinfo") == 0 ||
++             RuntimeFnName.compare("__remove_heap_oinfo") == 0)
++      return HEAPALLOC;
++    else if (RuntimeFnName.compare("__placement_new_handle") == 0)
++      return PLACEMENTNEW;
++    else if (RuntimeFnName.compare("__reinterpret_casting_handle") == 0)
++      return REINTERPRET;
++    else
++      return REALLOC;
++  }
++
++  void HexTypeLLVMUtil::insertUpdate(Module *SrcM, IRBuilder<> &Builder,
++                                 std::string RuntimeFnName, Value *ObjAddr,
++                                 StructElementInfoTy &Elements,
++                                 uint32_t TypeSize, Value *ArraySize,
++                                 Value *ReallocAddr, BasicBlock *BasicBlock) {
++    uint32_t AllocType = getAllocType(RuntimeFnName);
++    if (AllocType == REALLOC)
++      emitInstForObjTrace(SrcM, Builder, Elements, VLAOBJADD,
++                          ObjAddr,
++                          ArraySize, TypeSize, 0,
++                          AllocType, ReallocAddr, BasicBlock);
++    else if (AllocType == PLACEMENTNEW || AllocType == REINTERPRET)
++      emitInstForObjTrace(SrcM, Builder, Elements, CONOBJADD,
++                          ObjAddr, ArraySize, TypeSize, 0,
++                          AllocType, NULL, BasicBlock);
++    else if (dyn_cast<ConstantInt>(ArraySize) && AllocType != HEAPALLOC) {
++      ConstantInt *constantSize = dyn_cast<ConstantInt>(ArraySize);
++      for (uint32_t i=0; i<constantSize->getZExtValue(); i++)
++        emitInstForObjTrace(SrcM, Builder, Elements, CONOBJADD,
++                            ObjAddr, ArraySize, TypeSize, i,
++                            AllocType, NULL, BasicBlock);
++    }
++    else
++      emitInstForObjTrace(SrcM, Builder, Elements, VLAOBJADD,
++                     ObjAddr,
++                     ArraySize, TypeSize, 0,
++                     AllocType, NULL, BasicBlock);
++  }
++
++  void HexTypeLLVMUtil::insertRemove(Module *SrcM, IRBuilder<> &Builder,
++                                 std::string RuntimeFnName, Value *ObjAddr,
++                                 StructElementInfoTy &Elements,
++                                 Value *ArraySize, int TypeSize,
++                                 BasicBlock *BasicBlock) {
++    if (Elements.size() == 0)
++      return;
++
++    if (ArraySize == NULL)
++      ArraySize = ConstantInt::get(Int64Ty, 1);
++
++    uint32_t AllocType = getAllocType(RuntimeFnName);
++    if (AllocType != HEAPALLOC && dyn_cast<ConstantInt>(ArraySize)) {
++      ConstantInt *constantSize = dyn_cast<ConstantInt>(ArraySize);
++      for (uint32_t i=0;i<constantSize->getZExtValue();i++)
++        emitInstForObjTrace(SrcM, Builder, Elements, CONOBJDEL,
++                            ObjAddr, ArraySize,
++                            TypeSize, i, AllocType, NULL, NULL);
++    }
++    else
++      emitInstForObjTrace(SrcM, Builder, Elements, VLAOBJDEL,
++                          ObjAddr, ArraySize, TypeSize, 0,
++                          AllocType, NULL, NULL);
++  }
++
++  void HexTypeLLVMUtil::syncModuleName(std::string& TargetStr) {
++    SmallVector<std::string, 12> RemoveStrs;
++    RemoveStrs.push_back("./");
++    RemoveStrs.push_back(".");
++    RemoveStrs.push_back("/");
++
++    for (unsigned long i=0; i<RemoveStrs.size(); i++)
++      removeTargetStr(TargetStr, RemoveStrs[i]);
++
++    removeTargetNum(TargetStr);
++  }
++
++  uint64_t HexTypeCommonUtil::getHashValueFromStr(std::string& str) {
++    syncTypeName(str);
++    unsigned char *className = new unsigned char[str.length() + 1];
++    strcpy((char *)className, str.c_str());
++    return crc64c(className);
++  }
++
++  uint64_t HexTypeCommonUtil::getHashValueFromSTy(StructType *STy) {
++    std::string str = STy->getName().str();
++    syncTypeName(str);
++    return getHashValueFromStr(str);
++  }
++
++  bool HexTypeCommonUtil::isInterestingStructType(StructType *STy) {
++    if (STy->isStructTy() &&
++        STy->hasName() &&
++        !STy->isLiteral() &&
++        !STy->isOpaque())
++      return true;
++
++    return false;
++  }
++
++  static bool isInterestingArrayType(ArrayType *ATy) {
++    Type *InnerTy = ATy->getElementType();
++
++    if (StructType *InnerSTy = dyn_cast<StructType>(InnerTy))
++      return HexTypeCommonUtil::isInterestingStructType(InnerSTy);
++
++    if (ArrayType *InnerATy = dyn_cast<ArrayType>(InnerTy))
++      return isInterestingArrayType(InnerATy);
++
++    return false;
++  }
++
++  bool HexTypeCommonUtil::isInterestingType(Type *rootType) {
++    if (StructType *STy = dyn_cast<StructType>(rootType))
++      return isInterestingStructType(STy);
++
++    if (ArrayType *ATy = dyn_cast<ArrayType>(rootType))
++      return isInterestingArrayType(ATy);
++
++    return false;
++  }
++
++  AllocaInst* HexTypeLLVMUtil::findAllocaForValue(Value *V) {
++    if (AllocaInst *AI = dyn_cast<AllocaInst>(V))
++      return AI; // TODO: isInterestingAlloca(*AI) ? AI : nullptr;
++
++    AllocaInst *Res = nullptr;
++    if (CastInst *CI = dyn_cast<CastInst>(V))
++      Res = findAllocaForValue(CI->getOperand(0));
++    else if (PHINode *PN = dyn_cast<PHINode>(V))
++      for (Value *IncValue : PN->incoming_values()) {
++        if (IncValue == PN) continue;
++        AllocaInst *IncValueAI = findAllocaForValue(IncValue);
++        if (IncValueAI == nullptr || (Res != nullptr && IncValueAI != Res))
++          return nullptr;
++        Res = IncValueAI;
++      }
++    return Res;
++  }
++
++  void HexTypeLLVMUtil::setTypeDetailInfo(StructType *STy,
++                                          TypeDetailInfo &TargetDetailInfo,
++                                          uint32_t AllTypeNum) {
++    std::string str = STy->getName().str();
++    HexTypeCommonUtil::syncTypeName(str);
++    TargetDetailInfo.TypeName.assign(str);
++    TargetDetailInfo.TypeHashValue =
++      HexTypeCommonUtil::getHashValueFromSTy(STy);
++    TargetDetailInfo.TypeIndex = AllTypeNum;
++
++    if (ClMakeTypeInfo) {
++      char fileName[MAXLEN];
++      char tmp[MAXLEN];
++      strcpy(fileName, "/typehashinfo.txt");
++      sprintf(tmp,"%" PRIu64 " %s", TargetDetailInfo.TypeHashValue, str.c_str());
++      writeInfoToFile(tmp, fileName);
++    }
++    return;
++  }
++
++  void HexTypeLLVMUtil::parsingTypeInfo(StructType *STy, TypeInfo &NewType,
++                                    uint32_t AllTypeNum) {
++    NewType.StructTy = STy;
++    NewType.ElementSize = STy->elements().size();
++    setTypeDetailInfo(STy, NewType.DetailInfo, AllTypeNum);
++    // get parent type information
++    if (STy->elements().size() > 0)
++      for (StructType::element_iterator I = STy->element_begin(),
++           E = STy->element_end(); I != E; ++I) {
++        StructType *innerSTy = dyn_cast<StructType>(*I);
++        if (innerSTy && isInterestingStructType(innerSTy)) {
++          TypeDetailInfo ParentTmp;
++          setTypeDetailInfo(innerSTy, ParentTmp, 0);
++          NewType.DirectParents.push_back(ParentTmp);
++        }
++      }
++
++    return;
++  }
++}

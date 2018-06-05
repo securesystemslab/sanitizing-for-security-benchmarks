@@ -1,0 +1,1008 @@
+diff --git a/include/clang/Basic/Sanitizers.def b/include/clang/Basic/Sanitizers.def
+index 4b68593..fa424a3 100644
+--- a/include/clang/Basic/Sanitizers.def
++++ b/include/clang/Basic/Sanitizers.def
+@@ -50,6 +50,9 @@ SANITIZER("memory", Memory)
+ // ThreadSanitizer
+ SANITIZER("thread", Thread)
+ 
++// HexType
++SANITIZER("hextype", HexType)
++
+ // LeakSanitizer
+ SANITIZER("leak", Leak)
+ 
+diff --git a/include/clang/Driver/SanitizerArgs.h b/include/clang/Driver/SanitizerArgs.h
+index 072ddee..d14dbdc 100644
+--- a/include/clang/Driver/SanitizerArgs.h
++++ b/include/clang/Driver/SanitizerArgs.h
+@@ -46,6 +46,7 @@ class SanitizerArgs {
+   bool needsSharedAsanRt() const { return AsanSharedRuntime; }
+   bool needsTsanRt() const { return Sanitizers.has(SanitizerKind::Thread); }
+   bool needsMsanRt() const { return Sanitizers.has(SanitizerKind::Memory); }
++  bool needsHexTypeRt() const { return Sanitizers.has(SanitizerKind::HexType); }
+   bool needsLsanRt() const {
+     return Sanitizers.has(SanitizerKind::Leak) &&
+            !Sanitizers.has(SanitizerKind::Address);
+diff --git a/lib/CodeGen/BackendUtil.cpp b/lib/CodeGen/BackendUtil.cpp
+index 9727fc9..606895f 100644
+--- a/lib/CodeGen/BackendUtil.cpp
++++ b/lib/CodeGen/BackendUtil.cpp
+@@ -178,6 +178,16 @@ static void addBoundsCheckingPass(const PassManagerBuilder &Builder,
+   PM.add(createBoundsCheckingPass());
+ }
+ 
++static void addHexTypePass(const PassManagerBuilder &Builder,
++                                    PassManagerBase &PM) {
++  PM.add(createHexTypePass());
++}
++
++static void addHexTypeTreePass(const PassManagerBuilder &Builder,
++                                    PassManagerBase &PM) {
++  PM.add(createHexTypeTreePass());
++}
++
+ static void addSanitizerCoveragePass(const PassManagerBuilder &Builder,
+                                      legacy::PassManagerBase &PM) {
+   const PassManagerBuilderWrapper &BuilderWrapper =
+@@ -404,6 +414,17 @@ void EmitAssemblyHelper::CreatePasses(FunctionInfoIndex *FunctionIndex) {
+                            addDataFlowSanitizerPass);
+   }
+ 
++  if (LangOpts.Sanitize.has(SanitizerKind::HexType)) {
++	  PMBuilder.addExtension(PassManagerBuilder::EP_ModuleOptimizerEarly,
++			  addHexTypeTreePass);
++	  PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
++			  addHexTypeTreePass);
++	  PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
++			  addHexTypePass);
++	  PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
++			  addHexTypePass);
++  }
++
+   // Set up the per-function pass manager.
+   legacy::FunctionPassManager *FPM = getPerFunctionPasses();
+   if (CodeGenOpts.VerifyModule)
+diff --git a/lib/CodeGen/CGClass.cpp b/lib/CodeGen/CGClass.cpp
+index 8a82be9..36d235b 100644
+--- a/lib/CodeGen/CGClass.cpp
++++ b/lib/CodeGen/CGClass.cpp
+@@ -27,6 +27,7 @@
+ #include "llvm/IR/Intrinsics.h"
+ #include "llvm/IR/Metadata.h"
+ #include "llvm/Transforms/Utils/SanitizerStats.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
+ 
+ using namespace clang;
+ using namespace CodeGen;
+@@ -2516,6 +2517,50 @@ void CodeGenFunction::EmitVTablePtrCheckForCall(const CXXRecordDecl *RD,
+   EmitVTablePtrCheck(RD, VTable, TCK, Loc);
+ }
+ 
++llvm::Value *CodeGenFunction::getHashValueFromQualType(QualType &T) {
++
++  llvm::HexTypeCommonUtil HexTypeUtil;
++
++  if (const RecordType *ClassTy = T->getAs<RecordType>()) {
++    const CXXRecordDecl *ClassDecl = cast<CXXRecordDecl>(ClassTy->getDecl());
++    if ((!ClassDecl) || !ClassDecl->isCompleteDefinition() ||
++        !ClassDecl->hasDefinition() || ClassDecl->isAnonymousStructOrUnion()) {
++      return nullptr;
++    }
++
++    std::string DstTyStr =
++      getTypes().getCGRecordLayout(ClassDecl).getLLVMType()->getName();
++    uint64_t DstHashValue = HexTypeUtil.getHashValueFromStr(DstTyStr);
++    return llvm::ConstantInt::get(Int64Ty, DstHashValue);
++  }
++
++  return nullptr;
++}
++
++void CodeGenFunction::EmitHexTypeCheckForchangingCast(QualType T,
++                                                      llvm::Value *Base,
++                                                      llvm::Value *Derived,
++                                                      bool MayBeNull,
++                                                      CFITypeCheckKind TCK,
++                                                      SourceLocation Loc) {
++  if (llvm::Value *DstTyHashValue = getHashValueFromQualType(T)) {
++    llvm::Value *DynamicArgs[] = { Base, Derived };
++    HexEmitCheck("__type_casting_verification_changing", DynamicArgs,
++                 DstTyHashValue);
++  }
++}
++
++void CodeGenFunction::EmitHexTypeCheckForCast(QualType T,
++                                              llvm::Value *Derived,
++                                              bool MayBeNull,
++                                              CFITypeCheckKind TCK,
++                                              SourceLocation Loc) {
++  if (llvm::Value *DstTyHashValue = getHashValueFromQualType(T)) {
++    llvm::Value *DynamicArgs[] = { Derived };
++    HexEmitCheck("__type_casting_verification", DynamicArgs, DstTyHashValue);
++  }
++}
++
+ void CodeGenFunction::EmitVTablePtrCheckForCast(QualType T,
+                                                 llvm::Value *Derived,
+                                                 bool MayBeNull,
+@@ -2642,6 +2687,23 @@ void CodeGenFunction::EmitVTablePtrCheck(const CXXRecordDecl *RD,
+             {CastedVTable, ValidVtable});
+ }
+ 
++// insert instrumentation to handle reinterpret_cast
++void CodeGenFunction::EmitHexTypeReinterpretCast(QualType T,
++                                                 llvm::Value *Derived,
++                                                 bool MayBeNull,
++                                                 CFITypeCheckKind TCK,
++                                                 SourceLocation Loc) {
++  if (!getLangOpts().CPlusPlus)
++    return;
++
++  char InstName[100] = {"__reinterpret_casting_handle"};
++  if (auto *ClassTy = T->getAs<RecordType>()) {
++    const CXXRecordDecl *ClassDecl =
++      cast<CXXRecordDecl>(ClassTy->getDecl());
++    getTypeElement(ClassDecl, Derived, 0, InstName);
++  }
++}
++
+ // FIXME: Ideally Expr::IgnoreParenNoopCasts should do this, but it doesn't do
+ // quite what we want.
+ static const Expr *skipNoOpCastsAndParens(const Expr *E) {
+diff --git a/lib/CodeGen/CGExpr.cpp b/lib/CodeGen/CGExpr.cpp
+index 4a0f149..71596f6 100644
+--- a/lib/CodeGen/CGExpr.cpp
++++ b/lib/CodeGen/CGExpr.cpp
+@@ -33,6 +33,7 @@
+ #include "llvm/Support/ConvertUTF.h"
+ #include "llvm/Support/MathExtras.h"
+ #include "llvm/Transforms/Utils/SanitizerStats.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
+ 
+ using namespace clang;
+ using namespace CodeGen;
+@@ -2446,6 +2447,41 @@ static void emitCheckHandlerCall(CodeGenFunction &CGF,
+   }
+ }
+ 
++void CodeGenFunction::HexEmitCheck(StringRef FunName,
++                                   ArrayRef<llvm::Value *> DynamicArgs,
++                                   llvm::Value *DstTyHashValue) {
++  bool blacklisted =
++    CGM.getContext().getSanitizerBlacklist().isBlacklistedFunction(
++      CurFn->getName()) ? 1 : 0;
++  if (blacklisted) return;
++
++  SmallVector<llvm::Value *, 4> Args;
++  SmallVector<llvm::Type *, 4> ArgTypes;
++  Args.reserve(DynamicArgs.size() + 1);
++  ArgTypes.reserve(DynamicArgs.size() + 1);
++
++  for (size_t i = 0, n = DynamicArgs.size(); i != n; ++i) {
++    Args.push_back(EmitCheckValue(DynamicArgs[i]));
++    ArgTypes.push_back(IntPtrTy);
++  }
++  Args.push_back(DstTyHashValue);
++  ArgTypes.push_back(Builder.getInt64Ty());
++
++  llvm::FunctionType *FnType =
++    llvm::FunctionType::get(CGM.VoidTy, ArgTypes, false);
++
++  llvm::AttrBuilder B;
++  B.addAttribute(llvm::Attribute::UWTable);
++
++  llvm::Value *Fn = CGM.CreateRuntimeFunction(
++    FnType, FunName,
++    llvm::AttributeSet::get(getLLVMContext(),
++                            llvm::AttributeSet::FunctionIndex, B));
++
++  EmitNounwindRuntimeCall(Fn, Args);
++}
++
++
+ void CodeGenFunction::EmitCheck(
+     ArrayRef<std::pair<llvm::Value *, SanitizerMask>> Checked,
+     StringRef CheckName, ArrayRef<llvm::Constant *> StaticArgs,
+@@ -2555,6 +2591,33 @@ void CodeGenFunction::EmitCheck(
+   EmitBlock(Cont);
+ }
+ 
++void CodeGenFunction::HexEmitObjTraceInst(
++  StringRef InstName, ArrayRef<llvm::Value *> DynamicArgs) {
++  SmallVector<llvm::Value *, 4> Args;
++  SmallVector<llvm::Type *, 4> ArgTypes;
++  Args.reserve(DynamicArgs.size() + 1);
++  ArgTypes.reserve(DynamicArgs.size() + 1);
++
++  for (size_t i = 0, n = DynamicArgs.size(); i != n; ++i) {
++    Args.push_back(EmitCheckValue(DynamicArgs[i]));
++    ArgTypes.push_back(IntPtrTy);
++  }
++
++  llvm::AttrBuilder B;
++  B.addAttribute(llvm::Attribute::UWTable);
++
++  llvm::FunctionType *FnType =
++    llvm::FunctionType::get(CGM.VoidTy, ArgTypes, false);
++
++  llvm::Value *Fn = CGM.CreateRuntimeFunction(
++    FnType, InstName,
++    llvm::AttributeSet::get(getLLVMContext(),
++                            llvm::AttributeSet::FunctionIndex, B));
++  if(Fn != NULL && FnType != NULL) {
++    EmitNounwindRuntimeCall(Fn, Args);
++  }
++}
++
+ void CodeGenFunction::EmitCfiSlowPathCheck(
+     SanitizerMask Kind, llvm::Value *Cond, llvm::ConstantInt *TypeId,
+     llvm::Value *Ptr, ArrayRef<llvm::Constant *> StaticArgs) {
+@@ -3618,6 +3681,32 @@ LValue CodeGenFunction::EmitCastLValue(const CastExpr *E) {
+       EmitTypeCheck(TCK_DowncastReference, E->getExprLoc(),
+                     Derived.getPointer(), E->getType());
+ 
++    llvm::HexTypeCommonUtil HexTypeCommonUtilSet;
++
++    // Insert HexType's type casting verification instrumentation.
++    if (SanOpts.has(SanitizerKind::HexType)) {
++      if (llvm::ClCreateCastRelatedTypeList)
++        HexTypeCommonUtilSet.updateCastingReleatedTypeIntoFile(
++          ConvertType(E->getType()));
++
++      llvm::Value *NonVirtualOffset =
++        CGM.GetNonVirtualBaseClassOffset(DerivedClassDecl,
++                                         E->path_begin(), E->path_end());
++      if (!NonVirtualOffset)
++        EmitHexTypeCheckForCast(E->getType(),
++                                LV.getAddress().getPointer(),
++                                /*MayBeNull=*/false,
++                                CFITCK_DerivedCast,
++                                E->getLocStart());
++      else
++        EmitHexTypeCheckForchangingCast(E->getType(),
++                                        LV.getAddress().getPointer(),
++                                        Derived.getPointer(),
++                                        /*MayBeNull=*/false,
++                                        CFITCK_DerivedCast,
++                                        E->getLocStart());
++    }
++
+     if (SanOpts.has(SanitizerKind::CFIDerivedCast))
+       EmitVTablePtrCheckForCast(E->getType(), Derived.getPointer(),
+                                 /*MayBeNull=*/false,
+diff --git a/lib/CodeGen/CGExprCXX.cpp b/lib/CodeGen/CGExprCXX.cpp
+index 64ed42b..cd072e8 100644
+--- a/lib/CodeGen/CGExprCXX.cpp
++++ b/lib/CodeGen/CGExprCXX.cpp
+@@ -20,10 +20,20 @@
+ #include "clang/Frontend/CodeGenOptions.h"
+ #include "llvm/IR/CallSite.h"
+ #include "llvm/IR/Intrinsics.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
++
++#define MAXLEN 10000
+ 
+ using namespace clang;
+ using namespace CodeGen;
+ 
++llvm::cl::opt<bool> ClHandlePlacementNew("handle-placement-new",
++                                         llvm::cl::desc(
++                                           "handle placement new"),
++                                         llvm::cl::Hidden,
++                                         llvm::cl::init(false));
++
+ static RequiredArgs
+ commonEmitCXXMemberOrOperatorCall(CodeGenFunction &CGF, const CXXMethodDecl *MD,
+                                   llvm::Value *This, llvm::Value *ImplicitParam,
+@@ -1268,6 +1278,89 @@ namespace {
+   };
+ }
+ 
++void CodeGenFunction::insertTypeRelationInfo(uint64_t TargetHashValue, uint64_t ParentHashValue,
++                                             std::map<uint64_t, HashSet*> &TargetStorage) {
++  HashSet *TargetSet;
++  bool isExist = true;
++  auto it = TargetStorage.find(TargetHashValue);
++
++  if (it == TargetStorage.end()) {
++    isExist = false;
++    TargetSet = new HashSet();
++  }
++  else
++    TargetSet = it->second;
++
++  TargetSet->insert(ParentHashValue);
++  if (!isExist)
++    TargetStorage.insert(make_pair(TargetHashValue, TargetSet));
++}
++
++void CodeGenFunction::getTypeRelationInfo(const CXXRecordDecl *TargetDecl,
++                                  const CXXRecordDecl *ParentDecl)
++                                  {
++  if ((!TargetDecl) || !TargetDecl->isCompleteDefinition() ||
++      !TargetDecl->hasDefinition() || TargetDecl->isAnonymousStructOrUnion()) {
++    return;
++  }
++
++  std::string TargetStr = TargetDecl->getName();
++  std::string ParentStr = ParentDecl->getName();
++  uint64_t TargetHashValue = HexTypeUtil.getHashValueFromStr(TargetStr);
++  uint64_t ParentHashValue = HexTypeUtil.getHashValueFromStr(ParentStr);
++
++  if (TargetDecl != ParentDecl &&
++      TargetHashValue != 0 && ParentHashValue != 0) {
++    const ASTRecordLayout &TargetLayout =
++      CGM.getContext().getASTRecordLayout(TargetDecl);
++    const ASTRecordLayout &ParentLayout =
++      CGM.getContext().getASTRecordLayout(ParentDecl);
++
++    if (TargetLayout.getDataSize() == ParentLayout.getDataSize()) {
++      insertTypeRelationInfo(TargetHashValue, ParentHashValue, TypePhantomInfo);
++      insertTypeRelationInfo(ParentHashValue, TargetHashValue, TypePhantomInfo);
++    }
++    insertTypeRelationInfo(TargetHashValue, ParentHashValue, TypeParentInfo);
++  }
++
++  CharUnits OffsetCU;
++  for (const auto &Base : ParentDecl->bases()) {
++    QualType FieldType = CGM.getContext().getBaseElementType(Base.getType());
++    const CXXRecordDecl *BaseDecl = FieldType->getAsCXXRecordDecl();
++    if (!BaseDecl)
++      continue;
++    if (BaseDecl && BaseDecl->isCompleteDefinition() &&
++        BaseDecl->hasDefinition() &&
++        !BaseDecl->isAnonymousStructOrUnion()) {
++      std::string dstStr = BaseDecl->getName();
++      getTypeRelationInfo(TargetDecl, BaseDecl);
++      getTypeRelationInfo(ParentDecl, BaseDecl);
++    }
++  }
++}
++
++void CodeGenFunction::getTypeElement(const CXXRecordDecl *ClassDecl,
++                                     llvm::Value *ValueAddr,
++                                     uint64_t offsetInt,
++                                     char *InstName) {
++  llvm::HexTypeCommonUtil HexTypeUtil;
++
++  if ((!ClassDecl) || !ClassDecl->isCompleteDefinition() ||
++      !ClassDecl->hasDefinition() || ClassDecl->isAnonymousStructOrUnion()) {
++    return;
++  }
++
++  std::string DstTyStr = ClassDecl->getName();
++  uint64_t DstHashValue = HexTypeUtil.getHashValueFromStr(DstTyStr);
++  llvm::Value *DstValue = llvm::ConstantInt::get(Int64Ty, DstHashValue);
++  llvm::Value *Offset = llvm::ConstantInt::get(Int64Ty, offsetInt);
++
++  llvm::Value *DynamicArgs[] = {ValueAddr, DstValue, Offset};
++  HexEmitObjTraceInst(InstName, DynamicArgs);
++
++  getTypeRelationInfo(ClassDecl, ClassDecl);
++}
++
+ /// Enter a cleanup to call 'operator delete' if the initializer in a
+ /// new-expression throws.
+ static void EnterNewDeleteCleanup(CodeGenFunction &CGF,
+@@ -1476,7 +1569,17 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
+ 
+     resultPtr = PHI;
+   }
+-  
++
++  if(ClHandlePlacementNew && E->getNumPlacementArgs() >= 1) {
++    auto *ClassTy = allocType->getAs<RecordType>();
++    if (ClassTy) {
++      char InstName[100] = {"__placement_new_handle"};
++      const CXXRecordDecl *ClassDecl =
++        cast<CXXRecordDecl>(ClassTy->getDecl());
++      getTypeElement(ClassDecl, resultPtr, 0, InstName);
++    }
++  }
++
+   return resultPtr;
+ }
+ 
+diff --git a/lib/CodeGen/CGExprScalar.cpp b/lib/CodeGen/CGExprScalar.cpp
+index 540e01f..2bdf709 100644
+--- a/lib/CodeGen/CGExprScalar.cpp
++++ b/lib/CodeGen/CGExprScalar.cpp
+@@ -30,6 +30,7 @@
+ #include "llvm/IR/GlobalVariable.h"
+ #include "llvm/IR/Intrinsics.h"
+ #include "llvm/IR/Module.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
+ #include <cstdarg>
+ 
+ using namespace clang;
+@@ -63,6 +64,7 @@ class ScalarExprEmitter
+   CGBuilderTy &Builder;
+   bool IgnoreResultAssign;
+   llvm::LLVMContext &VMContext;
++  llvm::HexTypeCommonUtil HexTypeCommonUtilSet;
+ public:
+ 
+   ScalarExprEmitter(CodeGenFunction &cgf, bool ira=false)
+@@ -1407,6 +1409,19 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
+                                       CE->getLocStart());
+     }
+ 
++    // to handle reinterpret_cast
++    if(ClHandleReinterpretCast &&
++       CGF.SanOpts.has(SanitizerKind::HexType)) {
++      if(isa<CXXReinterpretCastExpr>(CE)) {
++        if (auto PT = DestTy->getAs<PointerType>()) {
++          CGF.EmitHexTypeReinterpretCast(PT->getPointeeType(), Src,
++                                         true,
++                                         CodeGenFunction::CFITCK_DerivedCast,
++                                         CE->getLocStart());
++        }
++      }
++    }
++
+     return Builder.CreateBitCast(Src, DstTy);
+   }
+   case CK_AddressSpaceConversion: {
+@@ -1442,6 +1457,33 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
+                                     CodeGenFunction::CFITCK_DerivedCast,
+                                     CE->getLocStart());
+ 
++    // Insert HexType's type casting verification instrumentation.
++    if (CGF.SanOpts.has(SanitizerKind::HexType)) {
++
++      if (llvm::ClCreateCastRelatedTypeList)
++        HexTypeCommonUtilSet.updateCastingReleatedTypeIntoFile(
++          ConvertType(E->getType()));
++
++      llvm::Value *NonVirtualOffset =
++        CGF.CGM.GetNonVirtualBaseClassOffset(DerivedClassDecl,
++                                             CE->path_begin(), CE->path_end());
++      CGF.getTypeRelationInfo(DerivedClassDecl, DerivedClassDecl);
++
++      if (!NonVirtualOffset)
++        CGF.EmitHexTypeCheckForCast(DestTy->getPointeeType(),
++                                    Base.getPointer(),
++                                    /*MayBeNull=*/false,
++                                    CodeGenFunction::CFITCK_DerivedCast,
++                                    CE->getLocStart());
++      else
++        CGF.EmitHexTypeCheckForchangingCast(DestTy->getPointeeType(),
++                                            Base.getPointer(),
++                                            Derived.getPointer(),
++                                            /*MayBeNull=*/false,
++                                            CodeGenFunction::CFITCK_DerivedCast,
++                                            CE->getLocStart());
++    }
++
+     return Derived.getPointer();
+   }
+   case CK_UncheckedDerivedToBase:
+diff --git a/lib/CodeGen/CodeGenFunction.cpp b/lib/CodeGen/CodeGenFunction.cpp
+index 0e118b8..e8f38d7 100644
+--- a/lib/CodeGen/CodeGenFunction.cpp
++++ b/lib/CodeGen/CodeGenFunction.cpp
+@@ -37,6 +37,14 @@
+ using namespace clang;
+ using namespace CodeGen;
+ 
++llvm::cl::opt<bool> ClHandleReinterpretCast(
++  "handle-reinterpret-cast", llvm::cl::desc("handle reinterpret cast"),
++  llvm::cl::Hidden, llvm::cl::init(false));
++
++llvm::cl::opt<bool> ClEmitClangTypeInfo(
++  "create-clang-typeinfo", llvm::cl::desc("create clang level type information"),
++  llvm::cl::Hidden, llvm::cl::init(false));
++
+ CodeGenFunction::CodeGenFunction(CodeGenModule &cgm, bool suppressNewContext)
+     : CodeGenTypeCache(cgm), CGM(cgm), Target(cgm.getTarget()),
+       Builder(cgm, cgm.getModule().getContext(), llvm::ConstantFolder(),
+@@ -94,6 +102,24 @@ CodeGenFunction::~CodeGenFunction() {
+   if (getLangOpts().OpenMP) {
+     CGM.getOpenMPRuntime().functionFinished(*this);
+   }
++
++  if (ClEmitClangTypeInfo) {
++    char fileName[MAXLEN];
++    char tmp[MAXLEN];
++    strcpy(fileName, "/typeinfo.txt");
++    std::map<uint64_t, HashSet*>::iterator it;
++    for (it = TypeParentInfo.begin(); it != TypeParentInfo.end(); ++it)
++      for (uint64_t parent : *it->second) {
++        sprintf(tmp, "1 %" PRIu64" %" PRIu64"", it->first, parent);
++        HexTypeUtil.writeInfoToFile(tmp, fileName);
++      }
++
++    for (it = TypePhantomInfo.begin(); it != TypePhantomInfo.end(); ++it)
++      for (uint64_t parent : *it->second) {
++        sprintf(tmp, "2 %" PRIu64" %" PRIu64"", it->first, parent);
++        HexTypeUtil.writeInfoToFile(tmp, fileName);
++      }
++  }
+ }
+ 
+ CharUnits CodeGenFunction::getNaturalPointeeTypeAlignment(QualType T,
+diff --git a/lib/CodeGen/CodeGenFunction.h b/lib/CodeGen/CodeGenFunction.h
+index 85d5f7a..f75f5c8 100644
+--- a/lib/CodeGen/CodeGenFunction.h
++++ b/lib/CodeGen/CodeGenFunction.h
+@@ -37,6 +37,10 @@
+ #include "llvm/IR/ValueHandle.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Transforms/Utils/SanitizerStats.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
++
++extern llvm::cl::opt<bool> ClHandleReinterpretCast;
++#define MAXLEN 10000
+ 
+ namespace llvm {
+ class BasicBlock;
+@@ -171,6 +175,11 @@ public:
+   /// we prefer to insert allocas.
+   llvm::AssertingVH<llvm::Instruction> AllocaInsertPt;
+ 
++  llvm::HexTypeCommonUtil HexTypeUtil;
++  typedef std::set<uint64_t> HashSet;
++  std::map<uint64_t, HashSet*> TypeParentInfo;
++  std::map<uint64_t, HashSet*> TypePhantomInfo;
++
+   /// \brief API for captured statement code generation.
+   class CGCapturedStmtInfo {
+   public:
+@@ -1899,7 +1908,10 @@ public:
+ 
+   llvm::Value *EmitLifetimeStart(uint64_t Size, llvm::Value *Addr);
+   void EmitLifetimeEnd(llvm::Value *Size, llvm::Value *Addr);
+-
++  void getTypeElement(const CXXRecordDecl *,
++                      llvm::Value *, uint64_t , char *);
++  void getTypeRelationInfo(const CXXRecordDecl *, const CXXRecordDecl *);
++  void insertTypeRelationInfo(uint64_t, uint64_t, std::map<uint64_t, HashSet*> &);
+   llvm::Value *EmitCXXNewExpr(const CXXNewExpr *E);
+   void EmitCXXDeleteExpr(const CXXDeleteExpr *E);
+ 
+@@ -3048,6 +3060,21 @@ public:
+                  StringRef CheckName, ArrayRef<llvm::Constant *> StaticArgs,
+                  ArrayRef<llvm::Value *> DynamicArgs);
+ 
++  void HexEmitCheck(StringRef FunName, ArrayRef<llvm::Value *> DynamicArgs,
++                    llvm::Value *DstTyHashValue);
++
++  void EmitHexTypeCheckForCast(QualType T, llvm::Value *Derived,
++                               bool MayBeNull, CFITypeCheckKind TCK,
++                               SourceLocation Loc);
++
++  void EmitHexTypeCheckForchangingCast(QualType T, llvm::Value *Base,
++                                       llvm::Value *Derived,
++                                       bool MayBeNull, CFITypeCheckKind TCK,
++                                       SourceLocation Loc);
++
++  llvm::Value *getHashValueFromQualType(QualType &T);
++  void HexEmitObjTraceInst(StringRef , ArrayRef<llvm::Value *> );
++
+   /// \brief Emit a slow path cross-DSO CFI check which calls __cfi_slowpath
+   /// if Cond if false.
+   void EmitCfiSlowPathCheck(SanitizerMask Kind, llvm::Value *Cond,
+@@ -3062,6 +3089,10 @@ public:
+   /// "trap-func-name" if specified.
+   llvm::CallInst *EmitTrapCall(llvm::Intrinsic::ID IntrID);
+ 
++  void EmitHexTypeReinterpretCast(QualType T, llvm::Value *Derived,
++                                  bool MayBeNull, CFITypeCheckKind TCK,
++                                  SourceLocation Loc);
++
+   /// \brief Emit a cross-DSO CFI failure handling function.
+   void EmitCfiCheckFail();
+ 
+diff --git a/lib/CodeGen/CodeGenTypes.cpp b/lib/CodeGen/CodeGenTypes.cpp
+index 554f9ff..4bb469c 100644
+--- a/lib/CodeGen/CodeGenTypes.cpp
++++ b/lib/CodeGen/CodeGenTypes.cpp
+@@ -49,27 +49,47 @@ void CodeGenTypes::addRecordTypeName(const RecordDecl *RD,
+                                      StringRef suffix) {
+   SmallString<256> TypeName;
+   llvm::raw_svector_ostream OS(TypeName);
+-  OS << RD->getKindName() << '.';
+-  
++  SmallString<256> TypeNameRtti;
++  llvm::raw_svector_ostream OSR(TypeNameRtti);
++
+   // Name the codegen type after the typedef name
+   // if there is no tag type name available
+   if (RD->getIdentifier()) {
+     // FIXME: We should not have to check for a null decl context here.
+     // Right now we do it because the implicit Obj-C decls don't have one.
+-    if (RD->getDeclContext())
+-      RD->printQualifiedName(OS);
+-    else
++    if (RD->getDeclContext()) {
++      if (dyn_cast<CXXRecordDecl>(RD)) {
++        TheCXXABI.getMangleContext().mangleCXXRTTI(Context.getTypeDeclType(RD),
++                                                   OSR);
++        if (getContext().getSanitizerBlacklist().isBlacklistedType(OSR.str()))
++          OS << "blacklistedtype" << '.';
++        else
++          OS << "trackedtype" << '.';
++        RD->printQualifiedName(OS);
++        //TheCXXABI.getMangleContext().mangleCXXRTTI(Context.getTypeDeclType(RD),
++        //              OS);
++      }
++      else {
++        OS << RD->getKindName() << '.';
++        RD->printQualifiedName(OS);
++      }
++    }
++    else {
++      OS << RD->getKindName() << '.';
+       RD->printName(OS);
++    }
+   } else if (const TypedefNameDecl *TDD = RD->getTypedefNameForAnonDecl()) {
++    OS << RD->getKindName() << '.';
+     // FIXME: We should not have to check for a null decl context here.
+     // Right now we do it because the implicit Obj-C decls don't have one.
+     if (TDD->getDeclContext())
+       TDD->printQualifiedName(OS);
+     else
+       TDD->printName(OS);
+-  } else
++  } else {
++    OS << RD->getKindName() << '.';
+     OS << "anon";
+-
++  }
+   if (!suffix.empty())
+     OS << suffix;
+ 
+diff --git a/lib/CodeGen/ItaniumCXXABI.cpp b/lib/CodeGen/ItaniumCXXABI.cpp
+index bdd9e2e..a853beb 100644
+--- a/lib/CodeGen/ItaniumCXXABI.cpp
++++ b/lib/CodeGen/ItaniumCXXABI.cpp
+@@ -33,10 +33,17 @@
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/IR/Intrinsics.h"
+ #include "llvm/IR/Value.h"
++#include "llvm/Transforms/Utils/HexTypeUtil.h"
+ 
+ using namespace clang;
+ using namespace CodeGen;
+ 
++llvm::cl::opt<bool> ClEnhanceDynamicCast(
++  "enhance-dynamic-cast",
++  llvm::cl::desc(
++    "enhance dynamic-cast's typecasting verification function"),
++  llvm::cl::Hidden, llvm::cl::init(false));
++
+ namespace {
+ class ItaniumCXXABI : public CodeGen::CGCXXABI {
+   /// VTables - All the vtables which have been defined.
+@@ -1228,6 +1235,27 @@ bool ItaniumCXXABI::shouldDynamicCastCallBeNullChecked(bool SrcIsPtr,
+   return SrcIsPtr;
+ }
+ 
++static llvm::Constant *getItaniumHexTypeDynamicCastFn(CodeGenFunction &CGF) {
++  llvm::Type *Int8PtrTy = CGF.Int8PtrTy;
++  llvm::Type *Int64Ty = CGF.Int64Ty;
++  llvm::Type *PtrDiffTy =
++    CGF.ConvertType(CGF.getContext().getPointerDiffType());
++
++  llvm::Type *Args[3] = { Int8PtrTy, Int64Ty, PtrDiffTy };
++
++  llvm::FunctionType *FTy =
++    llvm::FunctionType::get(Int8PtrTy, Args, false);
++
++  llvm::AttrBuilder B;
++  B.addAttribute(llvm::Attribute::UWTable);
++
++  return CGF.CGM.CreateRuntimeFunction(FTy,"__dynamic_casting_verification",
++                                       llvm::AttributeSet::get(
++                                         CGF.getLLVMContext(),
++                                         llvm::AttributeSet::FunctionIndex,
++                                         B));
++}
++
+ llvm::Value *ItaniumCXXABI::EmitDynamicCastCall(
+     CodeGenFunction &CGF, Address ThisAddr, QualType SrcRecordTy,
+     QualType DestTy, QualType DestRecordTy, llvm::BasicBlock *CastEnd) {
+@@ -1249,23 +1277,61 @@ llvm::Value *ItaniumCXXABI::EmitDynamicCastCall(
+ 
+   // Emit the call to __dynamic_cast.
+   llvm::Value *Value = ThisAddr.getPointer();
++  llvm::Value *DcastResult;
+   Value = CGF.EmitCastToVoidPtr(Value);
+ 
+   llvm::Value *args[] = {Value, SrcRTTI, DestRTTI, OffsetHint};
+-  Value = CGF.EmitNounwindRuntimeCall(getItaniumDynamicCastFn(CGF), args);
+-  Value = CGF.Builder.CreateBitCast(Value, DestLTy);
+ 
+-  /// C++ [expr.dynamic.cast]p9:
+-  ///   A failed cast to reference type throws std::bad_cast
+-  if (DestTy->isReferenceType()) {
+-    llvm::BasicBlock *BadCastBlock =
++  if((ClEnhanceDynamicCast) && CGF.SanOpts.has(SanitizerKind::HexType)) {
++    llvm::HexTypeCommonUtil HexTypeUtil;
++    QualType T = DestTy->getPointeeType();
++    auto *ClassTy = T->getAs<RecordType>();
++    if (ClassTy) {
++      const CXXRecordDecl *ClassDecl = cast<CXXRecordDecl>(ClassTy->getDecl());
++      if ((!ClassDecl) || !ClassDecl->isCompleteDefinition() ||
++          !ClassDecl->hasDefinition() || ClassDecl->isAnonymousStructOrUnion()) {
++        return Value;
++      }
++
++      auto &layout = CGM.getTypes().getCGRecordLayout(ClassDecl);
++      std::string DstTyStr = layout.getLLVMType()->getName();
++      uint64_t DstHashValue = HexTypeUtil.getHashValueFromStr(DstTyStr);
++      llvm::Value *DstValue = llvm::ConstantInt::get(CGF.Int64Ty,
++                                                     DstHashValue);
++      llvm::Value *DynamicArgs[] = { Value, DstValue, OffsetHint };
++
++      DcastResult = CGF.EmitNounwindRuntimeCall(
++        getItaniumHexTypeDynamicCastFn(CGF), DynamicArgs);
++      Value = CGF.Builder.CreateBitCast(DcastResult, DestLTy);
++      if (DestTy->isReferenceType()) {
++        llvm::BasicBlock *BadCastBlock =
++          CGF.createBasicBlock("dynamic_cast_hextype.bad_cast");
++
++        Value = CGF.Builder.CreateBitCast(DcastResult, DestLTy);
++
++        llvm::Value *IsNull = CGF.Builder.CreateIsNull(DcastResult);
++        CGF.Builder.CreateCondBr(IsNull, BadCastBlock, CastEnd);
++        CGF.EmitBlock(BadCastBlock);
++        EmitBadCastCall(CGF);
++      }
++    }
++  }
++  else {
++    Value = CGF.EmitNounwindRuntimeCall(getItaniumDynamicCastFn(CGF), args);
++    Value = CGF.Builder.CreateBitCast(Value, DestLTy);
++
++    /// C++ [expr.dynamic.cast]p9:
++    ///   A failed cast to reference type throws std::bad_cast
++    if (DestTy->isReferenceType()) {
++      llvm::BasicBlock *BadCastBlock =
+         CGF.createBasicBlock("dynamic_cast.bad_cast");
+ 
+-    llvm::Value *IsNull = CGF.Builder.CreateIsNull(Value);
+-    CGF.Builder.CreateCondBr(IsNull, BadCastBlock, CastEnd);
++      llvm::Value *IsNull = CGF.Builder.CreateIsNull(Value);
++      CGF.Builder.CreateCondBr(IsNull, BadCastBlock, CastEnd);
+ 
+-    CGF.EmitBlock(BadCastBlock);
+-    EmitBadCastCall(CGF);
++      CGF.EmitBlock(BadCastBlock);
++      EmitBadCastCall(CGF);
++    }
+   }
+ 
+   return Value;
+diff --git a/lib/Driver/ToolChain.cpp b/lib/Driver/ToolChain.cpp
+index c1305f1..a49c409 100644
+--- a/lib/Driver/ToolChain.cpp
++++ b/lib/Driver/ToolChain.cpp
+@@ -684,6 +684,9 @@ SanitizerMask ToolChain::getSupportedSanitizers() const {
+   if (getTriple().getArch() == llvm::Triple::x86 ||
+       getTriple().getArch() == llvm::Triple::x86_64)
+     Res |= CFIICall;
++  if (getTriple().getArch() == llvm::Triple::x86 ||
++      getTriple().getArch() == llvm::Triple::x86_64)
++    Res |= HexType;
+   return Res;
+ }
+ 
+diff --git a/lib/Driver/ToolChains.cpp b/lib/Driver/ToolChains.cpp
+index 6cc512b..41446c8 100644
+--- a/lib/Driver/ToolChains.cpp
++++ b/lib/Driver/ToolChains.cpp
+@@ -439,6 +439,8 @@ void DarwinClang::AddLinkRuntimeLibArgs(const ArgList &Args,
+     AddLinkSanitizerLibArgs(Args, CmdArgs, "asan");
+   if (Sanitize.needsUbsanRt())
+     AddLinkSanitizerLibArgs(Args, CmdArgs, "ubsan");
++  if (Sanitize.needsHexTypeRt())
++    AddLinkSanitizerLibArgs(Args, CmdArgs, "hextype");
+   if (Sanitize.needsTsanRt())
+     AddLinkSanitizerLibArgs(Args, CmdArgs, "tsan");
+   if (Sanitize.needsStatsRt()) {
+diff --git a/lib/Driver/Tools.cpp b/lib/Driver/Tools.cpp
+index 72e7caa..b5d729d 100644
+--- a/lib/Driver/Tools.cpp
++++ b/lib/Driver/Tools.cpp
+@@ -2945,6 +2945,9 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
+     NonWholeStaticRuntimes.push_back("stats");
+     RequiredSymbols.push_back("__sanitizer_stats_register");
+   }
++
++  if (SanArgs.needsHexTypeRt())
++    StaticRuntimes.push_back("hextype");
+ }
+ 
+ // Should be called before we add system libraries (C++ ABI, libstdc++/libc++,
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index d9a5588..f4ca296 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -126,7 +126,7 @@ if(LLVM_BUILD_EXTERNAL_COMPILER_RT AND EXISTS ${COMPILER_RT_SRC_ROOT}/)
+ 
+     # Add top-level targets for various compiler-rt test suites.
+     set(COMPILER_RT_TEST_SUITES check-asan check-asan-dynamic check-dfsan
+-      check-lsan check-msan check-sanitizer check-tsan check-ubsan
++      check-lsan check-msan check-sanitizer check-tsan check-ubsan check-runtime-hextype
+       check-profile check-cfi check-cfi-and-supported check-safestack)
+     foreach(test_suite ${COMPILER_RT_TEST_SUITES})
+       get_ext_project_build_command(run_test_suite ${test_suite})
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index f1a5838..bbb15df 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -86,3 +86,21 @@ set_target_properties(check-clang PROPERTIES FOLDER "Clang tests")
+ add_custom_target(clang-test)
+ add_dependencies(clang-test check-clang)
+ set_target_properties(clang-test PROPERTIES FOLDER "Clang tests")
++
++#########################################
++# Targetted testing for HEXTYPE clang
++
++set(CLANG_HEXTYPE_TEST_PARAMS
++  clang_site_config=${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg
++  clang_hextype_test_dir="CodeGen/hextype"
++  )
++
++add_lit_testsuite(check-clang-hextype "Running the HexType regression tests"
++  ${CMAKE_CURRENT_BINARY_DIR}
++  #LIT ${LLVM_LIT}
++  PARAMS ${CLANG_HEXTYPE_TEST_PARAMS}
++  DEPENDS ${CLANG_TEST_DEPS}
++  ARGS ${CLANG_TEST_EXTRA_ARGS}
++  )
++set_target_properties(check-clang PROPERTIES FOLDER "Clang HexType tests")
++
+diff --git a/test/CodeGen/hextype/hextype-dynamic_cast.cpp b/test/CodeGen/hextype/hextype-dynamic_cast.cpp
+new file mode 100644
+index 0000000..4a35c3a
+--- /dev/null
++++ b/test/CodeGen/hextype/hextype-dynamic_cast.cpp
+@@ -0,0 +1,28 @@
++// RUN: %clang_cc1 -std=c++11 -fsanitize=hextype -mllvm -enhance-dynamic-cast -emit-llvm %s -o - | FileCheck %s --strict-whitespace
++
++class Base {virtual void member(){}};
++class Derived : Base { int kk; };
++
++class parent {
++public:
++  int t;
++  int tt[100];
++  virtual int foo() { int a[100]; }
++};
++
++class child : public parent, public Derived {
++public:
++  int m[1000];
++};
++
++void normal_case() {
++  child test2;
++  Derived *derivedPtr = &test2;
++  child *result = dynamic_cast<child *>(derivedPtr);
++  // CHECK: call i8* @__dynamic_casting_verification
++}
++
++int main() {
++  normal_case();
++  return 1;
++}
+diff --git a/test/CodeGen/hextype/hextype-placementnew.cpp b/test/CodeGen/hextype/hextype-placementnew.cpp
+new file mode 100644
+index 0000000..0d3d878
+--- /dev/null
++++ b/test/CodeGen/hextype/hextype-placementnew.cpp
+@@ -0,0 +1,28 @@
++// RUN: %clang_cc1 -std=c++11 -fsanitize=hextype -mllvm -handle-placement-new -emit-llvm %s -o - | FileCheck %s --strict-whitespace
++
++extern void* operator new (unsigned long sz, void* v);
++
++class MyClass {
++   public:
++    ~MyClass() {
++    }
++};
++
++class MyClassChild : public MyClass {
++   public:
++   int data[1000];
++};
++
++void foo() {
++	int buffer[16];
++
++	MyClass* obj = new (buffer) MyClass();
++        // CHECK: call void @__update_direct_oinfo
++	static_cast<MyClassChild*>(obj);
++        // CHECK: call void @__type_casting_verification
++	obj->~MyClass();
++}
++
++int main() {
++    foo();
++}
+diff --git a/test/CodeGen/hextype/hextype-reinterpret.cpp b/test/CodeGen/hextype/hextype-reinterpret.cpp
+new file mode 100644
+index 0000000..0f15aba
+--- /dev/null
++++ b/test/CodeGen/hextype/hextype-reinterpret.cpp
+@@ -0,0 +1,23 @@
++// Check if hextype generates typecasting verification
++// instrumentation correctly.
++// RUN: %clang_cc1 -fsanitize=hextype -mllvm -handle-reinterpret-cast -emit-llvm %s -o - | FileCheck %s --strict-whitespace
++
++void *malloc(__SIZE_TYPE__ size);
++
++class S {
++  int _dummy;
++};
++
++class T : public S {
++  int m;
++};
++
++int main(){
++  char *str = (char *)malloc(sizeof(S));
++
++  S* pt = reinterpret_cast<S*>(str);
++  // CHECK: call void @__handle_reinterpret_cast
++  static_cast<T*>(pt);
++  // CHECK: call void @__type_casting_verification
++  return 0;
++}
+diff --git a/test/CodeGen/hextype/hextype-typecasting.cpp b/test/CodeGen/hextype/hextype-typecasting.cpp
+new file mode 100644
+index 0000000..86c1659
+--- /dev/null
++++ b/test/CodeGen/hextype/hextype-typecasting.cpp
+@@ -0,0 +1,17 @@
++// Check if hextype generates typecasting verification
++// instrumentation correctly.
++// RUN: %clang_cc1 -fsanitize=hextype -emit-llvm %s -o - | FileCheck %s --strict-whitespace
++
++class S {
++  int _dummy;
++};
++
++class T : public S {
++};
++
++int main(){
++  S *ps = new S();
++  T *pt = static_cast<T*>(ps);
++  // CHECK: call void @__type_casting_verification
++  return 0;
++}
+diff --git a/test/lit.cfg b/test/lit.cfg
+index e216634..48ff150 100644
+--- a/test/lit.cfg
++++ b/test/lit.cfg
+@@ -54,6 +54,12 @@ config.excludes = ['Inputs', 'CMakeLists.txt', 'README.txt', 'LICENSE.txt']
+ # test_source_root: The root path where tests are located.
+ config.test_source_root = os.path.dirname(__file__)
+ 
++# Override the test source root if hextype testing is specified.
++clang_hextype_test_dir = lit_config.params.get('clang_hextype_test_dir', None)
++if clang_hextype_test_dir:
++      config.test_source_root = os.path.join(os.path.dirname(__file__),
++                                                 clang_hextype_test_dir)
++
+ # test_exec_root: The root path where tests should be run.
+ clang_obj_root = getattr(config, 'clang_obj_root', None)
+ if clang_obj_root is not None:
+diff --git a/unittests/Frontend/CMakeLists.txt b/unittests/Frontend/CMakeLists.txt
+index 674f77b..622c8da 100644
+--- a/unittests/Frontend/CMakeLists.txt
++++ b/unittests/Frontend/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ set(LLVM_LINK_COMPONENTS
+   Support
+-  )
++  CodeGen
++)
+ 
+ add_clang_unittest(FrontendTests
+   FrontendActionTest.cpp

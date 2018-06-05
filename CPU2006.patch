@@ -1,0 +1,176 @@
+diff --git a/400.perlbench/src/perlio.c b/400.perlbench/src/perlio.c
+index c38fbec..677c815 100644
+--- a/400.perlbench/src/perlio.c
++++ b/400.perlbench/src/perlio.c
+@@ -748,7 +748,11 @@ PerlIO_find_layer(pTHX_ const char *name, STRLEN len, int load)
+ 	len = strlen(name);
+     for (i = 0; i < PL_known_layers->cur; i++) {
+ 	PerlIO_funcs *f = PL_known_layers->array[i].funcs;
++#ifdef PATCH_PERLBENCH_OVERFLOW
++        if (!strcmp(f->name, name) && f->name[len] == 0) {
++#else
+ 	if (memEQ(f->name, name, len) && f->name[len] == 0) {
++#endif
+ 	    PerlIO_debug("%.*s => %p\n", (int) len, name, (void*)f);
+ 	    return f;
+ 	}
+diff --git a/447.dealII/src/include/grid/tria_accessor.h b/447.dealII/src/include/grid/tria_accessor.h
+index ea24b8c..dfb6193 100644
+--- a/447.dealII/src/include/grid/tria_accessor.h
++++ b/447.dealII/src/include/grid/tria_accessor.h
+@@ -36,11 +36,13 @@ template <int dim>              class TriaObjectAccessor<2, dim>;
+ template <int dim>              class TriaObjectAccessor<3, dim>;
+ 
+ 
++#ifndef NO_DEALII_STD_PAIR
+ namespace std
+ {
+   template<class T1, class T2>
+   struct pair;
+ }
++#endif
+ 
+ // note: the file tria_accessor.templates.h is included at the end of
+ // this file.  this includes a lot of templates. originally, this was
+diff --git a/450.soplex/src/idlist.h b/450.soplex/src/idlist.h
+index 728b996..d5d8fdf 100644
+--- a/450.soplex/src/idlist.h
++++ b/450.soplex/src/idlist.h
+@@ -269,6 +269,15 @@ public:
+    }
+    //@}
+ 
++#ifdef SOPLEX_DANGSAN_MASK
++   static T *moveptr(T *ptr, ptrdiff_t delta)
++   {
++      unsigned long mask = 0x7fffffffffffffffUL;
++      unsigned long newptr = reinterpret_cast<unsigned long>(ptr) + delta;
++      unsigned long maskedptr = newptr & mask;
++      return reinterpret_cast<T*>(maskedptr);
++   }
++#endif
+ 
+    /**@name Miscellaneous */
+    //@{
+@@ -285,8 +294,12 @@ public:
+          IsList<T>::move(delta);
+          for (elem = last(); elem; elem = prev(elem))
+             if (elem != first())
++#ifdef SOPLEX_DANGSAN_MASK
++               elem->prev() = moveptr(elem->prev(), delta);
++#else
+                elem->prev() = reinterpret_cast<T*>(
+                   reinterpret_cast<char*>(elem->prev()) + delta);
++#endif
+       }
+    }
+ 
+diff --git a/450.soplex/src/islist.h b/450.soplex/src/islist.h
+index d8d2485..9ce4896 100644
+--- a/450.soplex/src/islist.h
++++ b/450.soplex/src/islist.h
+@@ -340,6 +340,16 @@ public:
+    }
+    //@}
+ 
++#ifdef SOPLEX_DANGSAN_MASK
++   static T *moveptr(T *ptr, ptrdiff_t delta)
++   {
++      unsigned long mask = 0x7fffffffffffffffUL;
++      unsigned long newptr = reinterpret_cast<unsigned long>(ptr) + delta;
++      unsigned long maskedptr = newptr & mask;
++      return reinterpret_cast<T*>(maskedptr);
++   }
++#endif
++
+    /**@name Miscellaneous */
+    //@{
+    /// adjusts list pointers to a new memory address.
+@@ -356,11 +366,20 @@ public:
+       if (the_first)
+       {
+          T* elem;
++#ifdef SOPLEX_DANGSAN_MASK
++         the_last  = moveptr(the_last, delta);
++         the_first = moveptr(the_first, delta);
++#else
+          the_last  = reinterpret_cast<T*>(reinterpret_cast<char*>(the_last) + delta);
+          the_first = reinterpret_cast<T*>(reinterpret_cast<char*>(the_first) + delta);
++#endif
+          for (elem = first(); elem; elem = next(elem))
+             if (elem != last())
++#ifdef SOPLEX_DANGSAN_MASK
++               elem->next() = moveptr(elem->next(), delta);
++#else
+                elem->next() = reinterpret_cast<T*>(reinterpret_cast<char*>(elem->next()) + delta);
++#endif
+       }
+    }
+ 
+diff --git a/450.soplex/src/svset.cc b/450.soplex/src/svset.cc
+index 3ea9872..07bda5f 100644
+--- a/450.soplex/src/svset.cc
++++ b/450.soplex/src/svset.cc
+@@ -254,6 +254,16 @@ void SVSet::reMax(int newmax)
+    list.move(set.reMax(newmax));
+ }
+ 
++#ifdef SOPLEX_DANGSAN_MASK
++static SVector::Element *moveptr(void *ptr, ptrdiff_t delta)
++{
++   unsigned long mask = 0x7fffffffffffffffUL;
++   unsigned long newptr = reinterpret_cast<unsigned long>(ptr) + delta;
++   unsigned long maskedptr = newptr & mask;
++   return reinterpret_cast<SVector::Element *>(maskedptr);
++}
++#endif
++
+ void SVSet::memRemax(int newmax)
+ {
+    ptrdiff_t delta = DataArray < SVector::Element > ::reMax(newmax);
+@@ -262,7 +272,11 @@ void SVSet::memRemax(int newmax)
+    {
+       for (DLPSV* ps = list.first(); ps; ps = list.next(ps))
+       {
++#ifdef SOPLEX_DANGSAN_MASK
++         SVector::Element * info = moveptr(ps->mem(), delta);
++#else
+          SVector::Element * info = reinterpret_cast<SVector::Element*>(reinterpret_cast<char*>(ps->mem()) + delta);
++#endif
+          int sz = info->idx;
+          int l_max = int( info->val );
+          assert(l_max >= sz );
+diff --git a/464.h264ref/src/mv-search.c b/464.h264ref/src/mv-search.c
+index 504d8c4..5eea29b 100644
+--- a/464.h264ref/src/mv-search.c
++++ b/464.h264ref/src/mv-search.c
+@@ -1016,7 +1016,12 @@ FastFullPelBlockMotionSearch (pel_t**   orig_pic,     // <--  not used
+ int
+ SATD (int* diff, int use_hadamard)
+ {
++#ifdef PATCH_H264REF_OVERFLOW
++  /* https://www.spec.org/cpu2006/Docs/faq.html#Run.05 */
++  int k, satd = 0, m[16], dd, d[16+1];
++#else
+   int k, satd = 0, m[16], dd, d[16];
++#endif
+   
+   if (use_hadamard)
+   {
+diff --git a/471.omnetpp/src/libs/cmdenv/heap.cc b/471.omnetpp/src/libs/cmdenv/heap.cc
+index 2c92a2c..510efed 100644
+--- a/471.omnetpp/src/libs/cmdenv/heap.cc
++++ b/471.omnetpp/src/libs/cmdenv/heap.cc
+@@ -295,6 +295,7 @@ void dispheap()
+ }
+ #endif
+ 
++#ifndef NO_OMNETPP_OPERATOR_NEW // Some sanitizers (e.g., ASan) can not link if there is a use-defined operator new
+ void *operator new(size_t m)
+ {
+ #ifdef HEAPCHECK
+@@ -400,3 +401,4 @@ void operator delete(void *p)
+     if(id==breakat) brk("DELETE");
+ #endif
+ }
++#endif // NO_OMNETPP_OPERATOR_NEW

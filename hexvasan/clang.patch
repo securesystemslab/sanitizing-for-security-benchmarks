@@ -1,0 +1,140 @@
+diff --git a/include/clang/Basic/Sanitizers.def b/include/clang/Basic/Sanitizers.def
+index c81273e..cd8d43c 100644
+--- a/include/clang/Basic/Sanitizers.def
++++ b/include/clang/Basic/Sanitizers.def
+@@ -75,6 +75,11 @@ SANITIZER("unreachable", Unreachable)
+ SANITIZER("vla-bound", VLABound)
+ SANITIZER("vptr", Vptr)
+ 
++SANITIZER("vasan", VASAN)
++SANITIZER("vasan-backtrace", VASANBacktrace)
++SANITIZER("vasan-stats", VASANStats)
++SANITIZER("vasan-libc", VASANLibc)
++
+ // IntegerSanitizer
+ SANITIZER("unsigned-integer-overflow", UnsignedIntegerOverflow)
+ 
+@@ -102,7 +107,7 @@ SANITIZER_GROUP("undefined", Undefined,
+                     FloatDivideByZero | IntegerDivideByZero | NonnullAttribute |
+                     Null | ObjectSize | Return | ReturnsNonnullAttribute |
+                     Shift | SignedIntegerOverflow | Unreachable | VLABound |
+-                    Function | Vptr)
++                    Function | Vptr | VASAN | VASANBacktrace | VASANStats | VASANLibc)
+ 
+ // -fsanitize=undefined-trap is an alias for -fsanitize=undefined.
+ SANITIZER_GROUP("undefined-trap", UndefinedTrap, Undefined)
+diff --git a/include/clang/Driver/SanitizerArgs.h b/include/clang/Driver/SanitizerArgs.h
+index 7b293e0..262d44d 100644
+--- a/include/clang/Driver/SanitizerArgs.h
++++ b/include/clang/Driver/SanitizerArgs.h
+@@ -47,6 +47,10 @@ class SanitizerArgs {
+   bool needsSharedAsanRt() const { return AsanSharedRuntime; }
+   bool needsTsanRt() const { return Sanitizers.has(SanitizerKind::Thread); }
+   bool needsMsanRt() const { return Sanitizers.has(SanitizerKind::Memory); }
++  bool needsVASANRt() const { return Sanitizers.has(SanitizerKind::VASAN); }
++  bool needsVASANStatsRt() const { return Sanitizers.has(SanitizerKind::VASANStats); }
++  bool needsVASANBacktraceRt() const { return Sanitizers.has(SanitizerKind::VASANBacktrace); }
++  bool needsVASANLibcRt() const { return Sanitizers.has(SanitizerKind::VASANLibc); }
+   bool needsLsanRt() const {
+     return Sanitizers.has(SanitizerKind::Leak) &&
+            !Sanitizers.has(SanitizerKind::Address);
+diff --git a/lib/CodeGen/BackendUtil.cpp b/lib/CodeGen/BackendUtil.cpp
+index 165b6dd..ff185e3 100644
+--- a/lib/CodeGen/BackendUtil.cpp
++++ b/lib/CodeGen/BackendUtil.cpp
+@@ -163,6 +163,15 @@ static void addBoundsCheckingPass(const PassManagerBuilder &Builder,
+   PM.add(createBoundsCheckingPass());
+ }
+ 
++static void addVASANPass(const PassManagerBuilder &Builder,
++                                    PassManagerBase &PM) {
++   PM.add(createVASANPass());
++}
++static void addVASANCallerPass(const PassManagerBuilder &Builder,
++                                    PassManagerBase &PM) {
++   PM.add(createVASANCallerPass());
++}
++
+ static void addSanitizerCoveragePass(const PassManagerBuilder &Builder,
+                                      legacy::PassManagerBase &PM) {
+   const PassManagerBuilderWrapper &BuilderWrapper =
+@@ -179,6 +188,8 @@ static void addSanitizerCoveragePass(const PassManagerBuilder &Builder,
+   PM.add(createSanitizerCoverageModulePass(Opts));
+ }
+ 
++
++
+ static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
+                                       legacy::PassManagerBase &PM) {
+   const PassManagerBuilderWrapper &BuilderWrapper =
+@@ -413,6 +424,21 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
+                            addDataFlowSanitizerPass);
+   }
+ 
++  	 if (LangOpts.Sanitize.has(SanitizerKind::VASANBacktrace) ||
++		 LangOpts.Sanitize.has(SanitizerKind::VASAN) || 
++		 LangOpts.Sanitize.has(SanitizerKind::VASANLibc) ||
++		 LangOpts.Sanitize.has(SanitizerKind::VASANStats)) {
++   PMBuilder.addExtension(PassManagerBuilder::EP_ModuleOptimizerEarly,
++                          addVASANPass);
++   PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
++                          addVASANPass);
++   PMBuilder.addExtension(PassManagerBuilder::EP_ModuleOptimizerEarly,
++ 			  addVASANCallerPass);
++   PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
++ 			  addVASANCallerPass);
++
++	 }
++
+   if (LangOpts.Sanitize.hasOneOf(SanitizerKind::Efficiency)) {
+     PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                            addEfficiencySanitizerPass);
+diff --git a/lib/Driver/Tools.cpp b/lib/Driver/Tools.cpp
+index 31d4360..921e5dc 100644
+--- a/lib/Driver/Tools.cpp
++++ b/lib/Driver/Tools.cpp
+@@ -3109,6 +3109,16 @@ static void linkSanitizerRuntimeDeps(const ToolChain &TC,
+   // There's no libdl on FreeBSD.
+   if (TC.getTriple().getOS() != llvm::Triple::FreeBSD)
+     CmdArgs.push_back("-ldl");
++  else if (TC.getSanitizerArgs().needsVASANLibcRt()) {
++    CmdArgs.push_back("-lexecinfo");
++    CmdArgs.push_back("-lelf");
++	}
++  else if (TC.getSanitizerArgs().needsVASANRt() ||
++		   TC.getSanitizerArgs().needsVASANBacktraceRt() ||
++		   TC.getSanitizerArgs().needsVASANStatsRt())
++  {
++	  CmdArgs.push_back("-lstdc++");
++  }
+ }
+ 
+ static void
+@@ -3127,6 +3137,12 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
+   if (SanArgs.needsStatsRt())
+     StaticRuntimes.push_back("stats_client");
+ 
++  // Only link into shared libs if someone passes -fsanitize=vasan-libc
++  if (SanArgs.needsVASANLibcRt())
++    StaticRuntimes.push_back("vasan_libc");
++
++
++ 
+   // Collect static runtimes.
+   if (Args.hasArg(options::OPT_shared) || TC.getTriple().isAndroid()) {
+     // Don't link static runtimes into DSOs or if compiling for Android.
+@@ -3173,6 +3189,14 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
+     NonWholeStaticRuntimes.push_back("stats");
+     RequiredSymbols.push_back("__sanitizer_stats_register");
+   }
++
++  if (SanArgs.needsVASANBacktraceRt())
++    StaticRuntimes.push_back("vasan_backtrace");
++  else if (SanArgs.needsVASANStatsRt())
++    StaticRuntimes.push_back("vasan_stats");
++  else if (SanArgs.needsVASANRt())
++    StaticRuntimes.push_back("vasan");
++
+   if (SanArgs.needsEsanRt())
+     StaticRuntimes.push_back("esan");
+ }

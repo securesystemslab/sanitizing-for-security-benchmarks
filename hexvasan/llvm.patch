@@ -1,0 +1,991 @@
+diff --git a/include/llvm/InitializePasses.h b/include/llvm/InitializePasses.h
+index 90ff82f..05d6223 100644
+--- a/include/llvm/InitializePasses.h
++++ b/include/llvm/InitializePasses.h
+@@ -338,6 +338,9 @@ void initializeWholeProgramDevirtPass(PassRegistry &);
+ void initializeWinEHPreparePass(PassRegistry&);
+ void initializeWriteBitcodePassPass(PassRegistry &);
+ void initializeXRayInstrumentationPass(PassRegistry &);
++void initializeVASANPass(PassRegistry&);
++void initializeVASANCallerPass(PassRegistry&);
++void initializeVACheckerPass(PassRegistry&);
+ }
+ 
+ #endif
+diff --git a/include/llvm/Transforms/Instrumentation.h b/include/llvm/Transforms/Instrumentation.h
+index 09eef7e..6ea41da 100644
+--- a/include/llvm/Transforms/Instrumentation.h
++++ b/include/llvm/Transforms/Instrumentation.h
+@@ -113,6 +113,14 @@ FunctionPass *createMemorySanitizerPass(int TrackOrigins = 0);
+ // Insert ThreadSanitizer (race detection) instrumentation
+ FunctionPass *createThreadSanitizerPass();
+ 
++// Insert VASAN instrumenation
++ModulePass *createVASANPass();
++
++// Insert VASANCaller instrumenation
++ModulePass *createVASANCallerPass();
++// Insert VAChecker instrumenation
++ModulePass *createVACheckerPass();
++
+ // Insert DataFlowSanitizer (dynamic data flow analysis) instrumentation
+ ModulePass *createDataFlowSanitizerPass(
+     const std::vector<std::string> &ABIListFiles = std::vector<std::string>(),
+diff --git a/lib/Transforms/Instrumentation/CMakeLists.txt b/lib/Transforms/Instrumentation/CMakeLists.txt
+index 57a569b..0c0e782 100644
+--- a/lib/Transforms/Instrumentation/CMakeLists.txt
++++ b/lib/Transforms/Instrumentation/CMakeLists.txt
+@@ -1,5 +1,7 @@
+ add_llvm_library(LLVMInstrumentation
+-  AddressSanitizer.cpp
++  VASAN.cpp
++VASANCaller.cpp
++AddressSanitizer.cpp
+   BoundsChecking.cpp
+   DataFlowSanitizer.cpp
+   GCOVProfiling.cpp
+diff --git a/lib/Transforms/Instrumentation/VASAN.cpp b/lib/Transforms/Instrumentation/VASAN.cpp
+new file mode 100644
+index 0000000..2bb0150
+--- /dev/null
++++ b/lib/Transforms/Instrumentation/VASAN.cpp
+@@ -0,0 +1,474 @@
++/* -*- Mode:C++; c-file-style: "linux"; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
++#include "llvm/ADT/PriorityQueue.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/Analysis/ConstantFolding.h"
++#include "llvm/ExecutionEngine/ExecutionEngine.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DebugInfo.h"
++#include "llvm/IR/DebugInfoMetadata.h"
++#include "llvm/IR/DebugLoc.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstVisitor.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/MDBuilder.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Type.h"
++#include "llvm/IR/TypeBuilder.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/TargetSelect.h"
++#include "llvm/TableGen/Error.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++
++#include <algorithm>
++
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <queue>
++#include <stdio.h>
++#include <string.h>
++#include <string>
++
++std::map<llvm::AllocaInst *, llvm::AllocaInst *> list_map;
++std::map<llvm::Value *, long int> variadic_map;
++using namespace llvm;
++using std::string;
++
++namespace {
++unsigned hash(unsigned x) {
++  x = ((x >> 16) ^ x) * 0x45d9f3b;
++  x = ((x >> 16) ^ x) * 0x45d9f3b;
++  x = (x >> 16) ^ x;
++  return x;
++}
++unsigned long res = 0;
++  unsigned hashType(Type *T, llvm::LLVMContext& Ctx, bool OuterType=true) {
++  unsigned Result = hash(T->getTypeID());
++
++/*
++  llvm::errs() << "Callee hashing type: ";
++  T->dump();
++  llvm::errs() << "Initial hash: " << Result << "\n";
++*/
++
++  if (auto *PointerTy = dyn_cast<PointerType>(T)) {
++    if (T->getPointerElementType()) {
++      if (auto *StructTy = dyn_cast<StructType>(T->getPointerElementType())) {
++
++        Result = hash(T->getPointerElementType()->getTypeID());
++        Result = hash(Result ^ StructTy->isPacked());
++        Result = hash(Result ^ StructTy->isLiteral());
++        Result = hash(Result ^ StructTy->isOpaque());
++
++        for (unsigned int i = 0; i < StructTy->getNumElements(); i++) {
++            Result = hash(Result ^ StructTy->getElementType(i)->getTypeID());
++        }
++        Result = hash(Result ^ StructTy->getTypeID());
++        res = Result;
++//        printf("Calleeee Pointer 1 %lu \n", res);
++        return (Result | 1);
++      }
++    } else {
++
++      Result = hash(Result ^ PointerTy->getAddressSpace());
++      Result = hash(Result ^ PointerTy->getTypeID());
++      res = Result;
++//      printf("Calleeee Pointer 2 %lu \n", res);
++      return (Result | 1);
++    }
++  }
++
++  if (auto *StructTy = dyn_cast<StructType>(T)) {
++
++    Result = hash(Result ^ StructTy->isPacked());
++    Result = hash(Result ^ StructTy->isLiteral());
++    Result = hash(Result ^ StructTy->isOpaque());
++
++    for (unsigned int i = 0; i < StructTy->getNumElements(); i++) {
++        Result = hash(Result ^ StructTy->getElementType(i)->getTypeID());
++    }
++    Result = hash(Result ^ StructTy->getTypeID());
++    res = Result;
++//    printf("Calleeee Struct  %lu \n", res);
++    return (Result & (~1));
++  }
++
++  if (auto *IntegerTy = dyn_cast<IntegerType>(T))  {
++//    llvm::errs() << "Integer type - bitwidth: " << IntegerTy->getBitWidth() << "\n";
++    // all integer types are implicitly cast to an equivalent type of at least 32 bits
++    if (OuterType)
++      Result = hash(Result ^ std::max<unsigned>(32, IntegerTy->getBitWidth()));
++    else
++      Result = hash(Result ^ IntegerTy->getBitWidth());
++  }
++
++  // Treat all floats as doubles
++  if (OuterType && T->isFloatTy()) {
++    T = Type::getDoubleTy(Ctx);
++    Result = hash(T->getTypeID());
++  }
++
++  if (auto *FunctionTy = dyn_cast<FunctionType>(T))
++    Result = hash(Result ^ FunctionTy->isVarArg());
++
++  if (auto *ArrayTy = dyn_cast<ArrayType>(T))
++    Result = hash(Result ^ ArrayTy->getNumElements());
++
++  if (auto *VectorTy = dyn_cast<VectorType>(T))
++    Result = hash(Result ^ VectorTy->getNumElements());
++
++  for (Type *SubType : T->subtypes()) {
++    Result = hash(Result ^ hashType(SubType, Ctx, false));
++  }
++  Result = hash(Result ^ T->getTypeID());
++  res = Result & (~1);
++  if (dyn_cast<PointerType>(T))
++    res |= 1;
++//  printf("Calleeee end %lu \n", res);
++  return res;
++}
++}
++
++namespace llvm {
++struct VASANVisitor : public InstVisitor<VASANVisitor> {
++public:
++  VASANVisitor(Module &M) : N_M(M) {}
++
++  std::map<Value *, std::set<BasicBlock *> *> checked;
++
++  void instrumentVAArgs();
++
++  void visitCallInst(CallInst &I) {
++    Function *ft = I.getCalledFunction();
++
++    if (ft == nullptr)
++      return;
++
++    auto ID = ft->getIntrinsicID();
++    if (ID != Intrinsic::vastart && 
++		ID != Intrinsic::vaend &&
++        ID != Intrinsic::vacopy)
++      return;
++
++    // Insert a call after the vararg func
++    IRBuilder<> B(I.getNextNode());
++    Type *VoidTy = Type::getVoidTy(N_M.getContext());
++    Type *valistPtr = PointerType::getUnqual(Type::getInt8Ty(N_M.getContext()));
++
++    if (ft->getIntrinsicID() == llvm::Intrinsic::vastart) {
++      // The first argument of the call is a bitcast
++      // of the va_list struct to i8*
++      BitCastInst *listCast = dyn_cast<BitCastInst>(I.getArgOperand(0));
++	  Value* listPtr = listCast ? listCast->getOperand(0) : I.getArgOperand(0);
++
++      if (listPtr->getType() != valistPtr)
++        listPtr = B.CreateBitCast(listPtr, valistPtr);
++
++      Constant *Func = N_M.getOrInsertFunction("__vasan_vastart", VoidTy,
++                                               valistPtr, nullptr);
++      B.CreateCall(Func, {listPtr});
++    } else if (ft->getIntrinsicID() == llvm::Intrinsic::vacopy) {
++      // arg0 of the intrinsic is the dst
++      // arg1 of the intrinsic is the src
++      // the VASAN runtime does it the other way around
++
++      BitCastInst *dstCast = dyn_cast<BitCastInst>(I.getArgOperand(0));
++	  Value* dstPtr = dstCast ? dstCast->getOperand(0) : I.getArgOperand(0);
++      BitCastInst *srcCast = dyn_cast<BitCastInst>(I.getArgOperand(1));
++	  Value* srcPtr = srcCast ? srcCast->getOperand(0) : I.getArgOperand(1);
++
++      if (srcPtr->getType() != valistPtr)
++        srcPtr = B.CreateBitCast(srcPtr, valistPtr);
++      if (dstPtr->getType() != valistPtr)
++        dstPtr = B.CreateBitCast(dstPtr, valistPtr);
++
++      Constant *Func = N_M.getOrInsertFunction("__vasan_vacopy", VoidTy,
++                                               valistPtr, valistPtr, nullptr);
++      B.CreateCall(Func, {srcPtr, dstPtr});
++    } else if (ft->getIntrinsicID() == llvm::Intrinsic::vaend) {
++
++      BitCastInst *listCast = dyn_cast<BitCastInst>(I.getArgOperand(0));
++	  Value* listPtr = listCast ? listCast->getOperand(0) : I.getArgOperand(0);
++
++      if (listPtr->getType() != valistPtr)
++        listPtr = B.CreateBitCast(listPtr, valistPtr);
++
++      Constant *Func =
++          N_M.getOrInsertFunction("__vasan_vaend", VoidTy, valistPtr, nullptr);
++      B.CreateCall(Func, {listPtr});
++    }
++  }
++
++  template<class InstType> void instrumentVaListReference(InstType& I) {  
++    // Trace through the IR to find the phi node that
++    // collapses the in_reg and in_mem values
++    auto BB = dyn_cast<BasicBlock>(I.getParent());
++
++    if (!BB || !*succ_begin(BB) || !*succ_begin(*succ_begin(BB)))
++      return;
++
++    // If this value has already been checked within this basic block
++    // then don't test it again
++    Type *VoidTy = Type::getVoidTy(N_M.getContext());
++    Type *Int64Ty = Type::getInt64Ty(N_M.getContext());
++    Type *valistPtr = PointerType::getUnqual(Type::getInt8Ty(N_M.getContext()));
++    Value *listPtr = I.getOperand(0);
++
++    auto InstrumentedBBs = checked.find(listPtr);
++    if (InstrumentedBBs != checked.end()) {
++      auto InstrumentedBB = (*InstrumentedBBs).second->find(BB);
++      if (InstrumentedBB != (*InstrumentedBBs).second->end())
++        return;
++      else
++        (*InstrumentedBBs).second->insert(BB);
++    } else {
++      std::set<BasicBlock *> *newBBs = new std::set<BasicBlock *>;
++      newBBs->insert(BB);
++      checked.insert(std::make_pair(listPtr, newBBs));
++    }
++
++    IRBuilder<> B(&I);
++    if (listPtr->getType() != valistPtr)
++      listPtr = B.CreateBitCast(listPtr, valistPtr);
++
++    auto CollapseNode = *succ_begin(BB);
++    while (!dyn_cast<PHINode>(CollapseNode->begin())) {
++      if (!*succ_begin(CollapseNode))
++        return;
++      CollapseNode = *succ_begin(CollapseNode);
++    }
++    unsigned long type_hash = 0;
++
++    if (PHINode *phi = dyn_cast<PHINode>(CollapseNode->begin()))
++      type_hash = hashType(phi->getType()->getPointerElementType(), N_M.getContext());
++
++    Constant *Func = N_M.getOrInsertFunction("__vasan_check_index_new", VoidTy,
++                                             valistPtr, Int64Ty, nullptr);
++    B.CreateCall(Func, {listPtr, ConstantInt::get(Int64Ty, type_hash)});
++
++  }
++
++  void visitLoadInst(LoadInst& I) {
++    // va_arg calls operating on va_lists that are not stored on the stack
++    // start with load instructions.
++    auto SrcGEP = dyn_cast<GEPOperator>(I.getOperand(0));
++
++    // We have at least two zero indices at the end.  More indices are
++    // possible if the va_list is part of a multilevel struct
++    if (!SrcGEP || SrcGEP->getNumIndices() < 2)
++      return;
++
++    // Cache the indices. We're going to need them later
++    std::vector<unsigned long> Idxs(SrcGEP->getNumIndices());
++    unsigned i = 0;
++    for (auto Idx = SrcGEP->idx_begin();
++         Idx != SrcGEP->idx_end();
++         ++Idx)
++    {
++      if (dyn_cast<ConstantInt>(*Idx))
++        Idxs[i++] = dyn_cast<ConstantInt>(*Idx)->getZExtValue();
++      else
++        Idxs[i++] = (unsigned long) ~0;
++    }
++
++    // last two indices must be zero
++    if (Idxs[SrcGEP->getNumIndices()-1] || 
++        Idxs[SrcGEP->getNumIndices()-2])
++      return;
++
++    auto SrcType = dyn_cast<CompositeType>(SrcGEP->getSourceElementType());
++
++    if (!SrcType)
++      return;
++
++    auto PointeeType = dyn_cast<CompositeType>(SrcType->getTypeAtIndex((unsigned)0));
++
++    if (!PointeeType)
++      return;
++
++    // traverse multilevel structs
++    for (i = 2; i < SrcGEP->getNumIndices() - 1; ++i)
++    {
++      if (Idxs[i] != (unsigned long) ~0)
++      {
++        PointeeType = dyn_cast<CompositeType>(PointeeType->getTypeAtIndex(Idxs[i]));
++
++        if (!PointeeType)
++          return;
++      }
++    }
++
++    // See if the innermost type is a va_list struct	  
++    auto InnerType = dyn_cast<StructType>(PointeeType);
++  
++    if (!InnerType || 
++        !InnerType->hasName() ||
++        InnerType->getName() != "struct.__va_list_tag")
++      return;
++
++    instrumentVaListReference<LoadInst>(I);
++  }
++
++  void visitGetElementPtrInst(GetElementPtrInst &I) {
++    // We need to find this instruction: %gp_offset_p = getelementptr
++    // inbounds %struct.__va_list_tag, %struct.__va_list_tag*
++    // %arraydecay2, i32 0, i32 0
++    auto BaseType = dyn_cast<PointerType>(I.getOperand(0)->getType());
++
++    if (!BaseType)
++      return;
++
++    auto PointeeType =
++        dyn_cast<StructType>(BaseType->getTypeAtIndex((unsigned)0));
++
++    if (!PointeeType || !PointeeType->hasName() ||
++        PointeeType->getName() != "struct.__va_list_tag")
++      return;
++
++    // Ok. this is a definite va_arg op. now we just need to verify that
++    // operands 1 and 2 are null
++    auto Index = dyn_cast<ConstantInt>(I.getOperand(1));
++    auto Field = dyn_cast<ConstantInt>(I.getOperand(2));
++
++    if (!Index || !Field || Index->getZExtValue() != 0 ||
++        (Field->getZExtValue() != 0 && Field->getZExtValue() != 1))
++      return;
++
++    instrumentVaListReference<GetElementPtrInst>(I);
++  }
++
++  void visitVAArgInstr(VAArgInst &I) {
++    // FreeBSD clang emits these afaik
++    errs() << "Saw VA Arg Inst: ";
++    I.dump();
++  }
++
++  Module &N_M;
++};
++}
++
++namespace {
++
++struct VASAN : public ModulePass {
++
++  static char ID;
++  LLVMContext *Context;
++
++  VASAN() : ModulePass(ID) {}
++
++  bool doInitialization(Module &M) { return true; }
++
++  bool doFinalization(Module &M) { return false; }
++
++  uint32_t file_rand = rand();
++  std::string file_r = std::to_string(file_rand);
++
++  virtual bool runOnModule(Module &M) {
++//    M.dump();
++    Context = &M.getContext();
++    auto dm = M.getDataLayout();
++    srand(time(nullptr));
++    std::string file_name;
++
++    for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
++      std::ofstream func_va;
++      Value *funcptr;
++
++      if (Function *Fnew = dyn_cast<Function>(F)) {
++        funcptr = dyn_cast<Value>(Fnew);
++      }
++      std::string addrtaken = "no";
++      std::string definition = "definition";
++      if (F->empty()) {
++        definition = "declaration";
++      } else
++        definition = "definition";
++
++      if (F->isVarArg()) {
++
++        /*================================================*/
++        uint32_t user_count = 0;
++        uint32_t user_call_count = 0;
++
++        for (User *func_users : F->users()) {
++          user_count++;
++
++          ConstantExpr *bc = dyn_cast<ConstantExpr>(func_users);
++          while (bc != nullptr && bc->isCast() && !bc->user_empty()) {
++            func_users = *bc->users().begin();
++            bc = dyn_cast<ConstantExpr>(func_users);
++          }
++
++          if (dyn_cast<CallInst>(func_users)) {
++            user_call_count++;
++          }
++        }
++        if (user_count == user_call_count) {
++          addrtaken = "no";
++        } else {
++          addrtaken = "yes";
++        }
++
++        /*================================================*/
++
++        long int unique_id = rand();
++        variadic_map.insert(
++            std::pair<llvm::Value *, long int>(funcptr, unique_id));
++        std::string str;
++        llvm::raw_string_ostream rso(str);
++        F->getFunctionType()->print(rso);
++        std::queue<User *> func_user;
++        uint32_t line_no;
++
++        if (MDNode *md = F->getMetadata("dbg")) {
++          if (DISubprogram *dl = dyn_cast<DISubprogram>(md)) {
++            line_no = dl->getLine();
++            file_name = dl->getFilename();
++          }
++        }
++
++        if (getenv("VASAN_LOG_PATH") != nullptr) {
++          char *home = getenv("VASAN_LOG_PATH");
++
++          std::string pathname = home + file_r + "vfunc.csv";
++
++          func_va.open(pathname, std::ios_base::app | std::ios_base::out);
++
++          func_va << unique_id << "\t" << F->getName().str() << "\t"
++                  << rso.str() << "\t" << F->getLinkage() << "\t" << file_name
++                  << "\t" << line_no;
++
++          func_va << "\t" << addrtaken << "\t" << definition << "\n";
++        }
++      }
++      func_va.close();
++    }
++    //================csv information ends here
++    VASANVisitor V(M);
++    V.visit(M);
++    //=============================================================
++    return false;
++  }
++
++  virtual bool runOnFunction(Function &F) { return false; }
++};
++}
++// register pass
++char VASAN::ID = 0;
++
++INITIALIZE_PASS(VASAN, "VASAN", "VASAN", false, false)
++
++ModulePass *llvm::createVASANPass() { return new VASAN(); }
+diff --git a/lib/Transforms/Instrumentation/VASANCaller.cpp b/lib/Transforms/Instrumentation/VASANCaller.cpp
+new file mode 100644
+index 0000000..ca4f20e
+--- /dev/null
++++ b/lib/Transforms/Instrumentation/VASANCaller.cpp
+@@ -0,0 +1,459 @@
++/* -*- Mode:C++; c-file-style: "linux"; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
++#include "llvm/Analysis/ConstantFolding.h"
++#include "llvm/Analysis/MemoryBuiltins.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DebugInfo.h"
++#include "llvm/IR/DebugInfoMetadata.h"
++#include "llvm/IR/DebugLoc.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstVisitor.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/MDBuilder.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Type.h"
++#include "llvm/Pass.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++
++#include <algorithm>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <queue>
++#include <stdio.h>
++#include <string.h>
++#include <string>
++
++#define MAXPATH 1000
++
++int counter = 1;
++extern std::map<llvm::Value *, long int> variadic_map;
++
++using namespace llvm;
++using std::string;
++
++namespace {
++  unsigned hash(unsigned x) {
++    x = ((x >> 16) ^ x) * 0x45d9f3b;
++    x = ((x >> 16) ^ x) * 0x45d9f3b;
++    x = (x >> 16) ^ x;
++    return x;
++  }
++  unsigned long res = 0;
++  template<typename InstType> 
++  unsigned hashType(Type *T, Value *V, InstType& I, unsigned int argNum, unsigned& skip, bool OuterType=true) {
++    unsigned Result = hash(T->getTypeID());
++
++    // nullptr should get a universal hash because we allow it to be cast to every
++    // other pointer type
++    if (dyn_cast<ConstantPointerNull>(V))
++      return 0xDEADBEEF;
++
++    /*
++    llvm::errs() << "Caller hashing type: ";
++    T->dump();
++    llvm::errs() << "> in value: ";
++    V->dump();
++    llvm::errs() << "> argNum: " << argNum << "\n";
++    llvm::errs() << "> subtype: " << !OuterType << "\n";
++    */
++
++    if (auto *PointerTy = dyn_cast<PointerType>(T)) {
++      if (T->getPointerElementType()) {
++        if (auto *StructTy = dyn_cast<StructType>(T->getPointerElementType())) {
++
++          Result = hash(T->getPointerElementType()->getTypeID());
++          Result = hash(Result ^ StructTy->isPacked());
++          Result = hash(Result ^ StructTy->isLiteral());
++          Result = hash(Result ^ StructTy->isOpaque());
++
++          for (unsigned int i = 0; i < StructTy->getNumElements(); i++) {
++            Result = hash(Result ^ StructTy->getElementType(i)->getTypeID());
++          }
++          Result = hash(Result ^ StructTy->getTypeID());
++          res = Result;
++          // use LSB as a pointer type bit
++          // Don't do it for pointers passed byval because those will not
++          // be retrieved as pointers
++          if (!OuterType || !CallSite(&I).isByValArgument(argNum-1))
++            res |= 1;
++//          printf("Caller Pointer 1 %lu \n", res);
++          return res;
++        }
++      } else {
++        Result = hash(Result ^ PointerTy->getAddressSpace());
++        Result = hash(Result ^ PointerTy->getTypeID());
++        res = Result;
++        // use LSB as a pointer type bit
++        // Don't do it for pointers passed byval because those will not
++        // be retrieved as pointers
++        if (!OuterType || !CallSite(&I).isByValArgument(argNum-1))
++          res |= 1;
++//        printf("Caller Pointer 2 %lu \n", res);
++        return res;
++      }
++    }
++
++    if(!(T->isAggregateType())) {
++      if (LoadInst *dl = dyn_cast<LoadInst>(V)) {
++        if (GetElementPtrInst *gepinst =
++            dyn_cast<GetElementPtrInst>((dl->getOperand(0)))) {
++          if (BitCastInst *binst = dyn_cast<BitCastInst>(gepinst->getOperand(0))) {
++            if (auto *StructTy = dyn_cast<StructType>(
++                  binst->getOperand(0)->getType()->getPointerElementType())) {
++
++              bool isUnpackedStruct = false;
++
++              auto sourceStructAlloc = dyn_cast<AllocaInst>(binst->getOperand(0));
++
++              // if it's a temporary stack-allocated struct, then we're looking at
++              // an auto-unpack
++              if (sourceStructAlloc &&
++                  sourceStructAlloc->hasName() &&
++                  sourceStructAlloc->getName().str().find("agg.tmp") == 0)
++              {
++//                llvm::errs() << "Maybe auto-unpacked: " << sourceStructAlloc->getName() << "\n";
++                isUnpackedStruct = true;
++              }
++
++              if (isUnpackedStruct)
++              {             
++
++
++                Result = hash(binst->getOperand(0)
++                              ->getType()
++                              ->getPointerElementType()
++                              ->getTypeID());
++
++                Result = hash(Result ^ StructTy->isPacked());
++                Result = hash(Result ^ StructTy->isLiteral());
++                Result = hash(Result ^ StructTy->isOpaque());
++
++                for (unsigned int i = 0; i < StructTy->getNumElements(); i++) {
++                  Result = hash(Result ^ StructTy->getElementType(i)->getTypeID());
++                }
++                Result = hash(Result ^ (binst->getOperand(0)
++                                        ->getType()
++                                        ->getPointerElementType()
++                                        ->getTypeID()));
++                res = Result;
++//                printf("Caller unpacking 1 %lu \n", res);                
++                skip = StructTy->getNumElements() - 1;
++                // not a pointer. mask out LSB
++                return (Result & (~1));
++              }
++            }
++          }
++        }        
++        else if (BitCastInst *binst = dyn_cast<BitCastInst>(dl->getOperand(0))) {
++
++          if (auto *StructTy = dyn_cast<StructType>(
++                binst->getOperand(0)->getType()->getPointerElementType())) {
++
++            bool isUnpackedStruct = false;
++
++            auto sourceStructAlloc = dyn_cast<AllocaInst>(binst->getOperand(0));
++
++            // if it's a temporary stack-allocated struct, then we're looking at
++            // an auto-unpack
++            if (sourceStructAlloc &&
++                sourceStructAlloc->hasName() &&
++                sourceStructAlloc->getName().str().find("agg.tmp") == 0)
++            {
++//              llvm::errs() << "Maybe auto-unpacked: " << sourceStructAlloc->getName() << "\n";
++              isUnpackedStruct = true;
++            }
++
++            if (isUnpackedStruct)
++            {             
++              Result = hash(binst->getOperand(0)
++                            ->getType()
++                            ->getPointerElementType()
++                            ->getTypeID());
++
++              Result = hash(Result ^ StructTy->isPacked());
++              Result = hash(Result ^ StructTy->isLiteral());
++              Result = hash(Result ^ StructTy->isOpaque());
++
++              for (unsigned int i = 0; i < StructTy->getNumElements(); i++) {
++                Result = hash(Result ^ StructTy->getElementType(i)->getTypeID());
++              }
++              Result = hash(Result ^ (binst->getOperand(0)
++                                      ->getType()
++                                      ->getPointerElementType()
++                                      ->getTypeID()));
++              res = Result;
++//              printf("Caller unpacking 2 %lu \n", res);
++//              skip = StructTy->getNumElements() - 1;
++              // not a pointer. mask out LSB
++              return (Result & (~1));
++            }
++          }        
++        }        
++      }
++    }
++
++    // Handle type promotion
++    // stijn: had to disable this. We can't distinguish auto-promoted types from
++    // manually cast types
++/*
++    if (CastInst* cinst = dyn_cast<CastInst>(V)) 
++    {
++      // This vararg might have been promoted
++
++      if (cinst->getOpcode() == Instruction::FPExt ||
++          cinst->getOpcode() == Instruction::SExt ||
++          cinst->getOpcode() == Instruction::ZExt)
++      {
++//        llvm::errs() << "Found type promoted argument - original type:";        
++        T = cinst->getOperand(0)->getType();
++//        T->dump();
++        Result = hash(T->getTypeID());
++      }
++    }
++*/
++  
++    if (auto *StructTy = dyn_cast<StructType>(T)) {
++
++      Result = hash(StructTy->getTypeID());
++      Result = hash(Result ^ StructTy->isPacked());
++      Result = hash(Result ^ StructTy->isLiteral());
++      Result = hash(Result ^ StructTy->isOpaque());
++
++      for (unsigned int i = 0; i < StructTy->getNumElements(); i++) {
++        Result = hash(Result ^ StructTy->getElementType(i)->getTypeID());
++      }
++
++      Result = hash(Result ^ StructTy->getTypeID());
++      res = Result;
++//      printf("Caller struct  %lu \n", res);
++      // not a pointer. mask out LSB
++      return (Result & (~1));
++    }
++  
++    if (auto *IntegerTy = dyn_cast<IntegerType>(T))
++      Result = hash(Result ^ IntegerTy->getBitWidth());
++
++    if (auto *FunctionTy = dyn_cast<FunctionType>(T))
++      Result = hash(Result ^ FunctionTy->isVarArg());
++
++    if (auto *ArrayTy = dyn_cast<ArrayType>(T))
++      Result = hash(Result ^ ArrayTy->getNumElements());
++
++    if (auto *VectorTy = dyn_cast<VectorType>(T))
++      Result = hash(Result ^ VectorTy->getNumElements());
++
++    for (Type *SubType : T->subtypes())
++      Result = hash(Result ^ hashType<InstType>(SubType, V, I, argNum, skip, false));
++
++    Result = hash(Result ^ T->getTypeID());
++    res = Result & (~1);
++    // use LSB as a pointer type bit
++    // Don't do it for pointers passed byval because those will not
++    // be retrieved as pointers
++    if (dyn_cast<PointerType>(T) && 
++        (!OuterType || !CallSite(&I).isByValArgument(argNum-1)))
++      res |= 1;
++//    printf("Caller end %lu \n", res);
++    return res;
++  }
++}
++
++namespace llvm {
++struct VASANCallerVisitor : public InstVisitor<VASANCallerVisitor> {
++public:
++  VASANCallerVisitor(Module &mod) : M(mod), Ctx(mod.getContext()) {
++    VoidTy = Type::getVoidTy(Ctx);
++    Int64Ty = Type::getInt64Ty(Ctx);
++    Int32Ty = Type::getInt32Ty(Ctx);
++    Int64PtrTy = PointerType::getUnqual(Type::getInt64Ty(Ctx));
++    file_rand = rand();
++    file_r = std::to_string(file_rand);
++//    M.dump();
++  }
++
++  template <typename InstType> void handleInst(InstType &I) {
++    auto getcallvalue = I.getCalledValue();
++
++    bool indirect = false;
++
++    while (auto bitcst = dyn_cast<ConstantExpr>(getcallvalue)) {
++      if (bitcst->isCast()) {
++        getcallvalue = bitcst->getOperand(0);
++      }
++    }
++    if (isa<Function>(getcallvalue)) {
++      indirect = false;
++    } else
++      indirect = true;
++
++    auto *getft = cast<PointerType>(getcallvalue->getType());
++    FunctionType *FT = cast<FunctionType>(getft->getPointerElementType());
++
++    if ((FT->isVarArg())) {
++      uint64_t random = rand();
++      Constant *id = ConstantInt::get(Type::getInt64Ty(Ctx), random);
++
++      //			  errs() << "Found Vararg Call:\n";
++      //			  I.dump();
++
++      std::string str;
++      llvm::raw_string_ostream rso(str);
++      unsigned line_no;
++      std::string file_name;
++      if (MDNode *md = I.getMetadata("dbg")) {
++        if (DILocation *dl = dyn_cast<DILocation>(md)) {
++          line_no = dl->getLine();
++          file_name = dl->getFilename();
++        }
++      }
++
++      if (getenv("VASAN_C_LOG_PATH") != nullptr) {
++
++        char *home = getenv("VASAN_C_LOG_PATH");
++
++        I.getFunctionType()->print(rso);
++        std::string pathname = home + file_r + "callsite.csv";
++        std::ofstream f_callsite;
++        f_callsite.open(pathname, std::ios_base::app | std::ios_base::out);
++        std::string _dir;
++        if (indirect) {
++          _dir = "indirect";
++        } else {
++          _dir = "direct";
++        }
++
++        f_callsite << random << "\t ---------------"
++                   << "\t" << rso.str() << "\t" << _dir << "\t"
++                   << I.getNumArgOperands() << "\t" << line_no << "\t"
++                   << file_name << "\t"
++                   << "\n";
++
++        f_callsite.close();
++      }
++
++      //================================================
++      FunctionType *FTypee = I.getFunctionType();
++      ArrayType *arr_type = ArrayType::get(
++          Int64Ty, (I.getNumArgOperands() - FTypee->getNumParams()));
++
++      std::vector<Constant *> arg_types;
++      unsigned i = 1;
++      unsigned skip = 0;
++      uint64_t result_hash = 0;
++      for (Value *arg_value : I.arg_operands()) {
++        if (skip == 0) {          
++          if (i > (FTypee->getNumParams())) {
++            skip = 0;
++            result_hash = hashType<InstType>(arg_value->getType(), arg_value, I, i, skip);
++            Constant *ty_val =
++              ConstantInt::get(Type::getInt64Ty(Ctx), result_hash);
++            arg_types.push_back(ty_val);
++          }
++        }
++        else {
++          skip--;
++        }
++        i++;
++      }
++
++      Constant *arg_c =
++          ConstantInt::get(Type::getInt64Ty(Ctx), ((I.getNumArgOperands()) -
++                                                   (FTypee->getNumParams())));
++      Constant *Init_array = ConstantArray::get(arr_type, arg_types);
++      arr_type = dyn_cast<ArrayType>(Init_array->getType());
++      GlobalVariable *type_array =
++          new GlobalVariable(M, arr_type, true, GlobalValue::InternalLinkage,
++                             Init_array, "Type_Array");
++
++      auto struct_ty = llvm::StructType::create(
++          Ctx, {Int64Ty, Int64Ty, Int64PtrTy}); // FIXME
++
++      GlobalVariable *struct_node =
++          new GlobalVariable(M, struct_ty, true, GlobalValue::InternalLinkage,
++                             nullptr, "Struct_variable");
++
++      Constant *array_ty_int =
++          ConstantExpr::getPointerCast(type_array, Int64PtrTy);
++      struct_node->setInitializer(
++          ConstantStruct::get(struct_ty, {id, arg_c, array_ty_int})); // FIXME
++
++      IRBuilder<> Builder(&I);
++      Value *Param[] = {struct_node};
++      Constant *GInit = M.getOrInsertFunction("__vasan_info_push", VoidTy,
++                                              struct_node->getType(), nullptr);
++      Builder.CreateCall(GInit, Param);
++
++      int value = 0;
++      Value *Param2 = {ConstantInt::get(Int32Ty, value)};
++      Constant *GFin =
++          M.getOrInsertFunction("__vasan_info_pop", VoidTy, Int32Ty, nullptr);
++
++      if (dyn_cast<InvokeInst>(&I)) {
++        InvokeInst *Invoke = dyn_cast<InvokeInst>(&I);
++        // Instrument landing pad instead
++        Builder.SetInsertPoint(
++            Invoke->getSuccessor(1)->getFirstNonPHI()->getNextNode());
++        Builder.CreateCall(GFin, Param2);
++      } else {
++
++        Builder.SetInsertPoint(I.getNextNode());
++        Builder.CreateCall(GFin, Param2);
++      }
++    }
++  }
++
++  void visitCallInst(CallInst &I) { handleInst<CallInst>(I); }
++
++  void visitInvokeInst(InvokeInst &I) { handleInst<InvokeInst>(I); }
++
++  Module &M;
++  LLVMContext &Ctx;
++  Type *VoidTy;
++  Type *Int64Ty;
++  Type *Int32Ty;
++  Type *Int64PtrTy;
++  uint32_t file_rand;
++  std::string file_r;
++};
++}
++
++namespace {
++
++struct VASANCaller : public ModulePass {
++
++  static char ID;
++  VASANCaller() : ModulePass(ID) {}
++
++  bool doInitialization(Module &M) { return true; }
++
++  bool doFinalization(Module &M) { return false; }
++  virtual bool runOnModule(Module &M) {
++    srand(time(0));
++
++    VASANCallerVisitor V(M);
++    V.visit(M);
++
++    return false;
++  }
++
++  virtual bool runOnFunction(Function &F) { return false; }
++};
++}
++
++// register pass
++char VASANCaller::ID = 0;
++
++INITIALIZE_PASS(VASANCaller, "VASANCaller", "VASANCaller", false, false)
++
++ModulePass *llvm::createVASANCallerPass() { return new VASANCaller(); }

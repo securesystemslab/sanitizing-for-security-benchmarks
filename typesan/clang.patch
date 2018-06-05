@@ -1,0 +1,479 @@
+diff --git a/include/clang/Basic/Sanitizers.def b/include/clang/Basic/Sanitizers.def
+index 4b68593..49cd4d1 100644
+--- a/include/clang/Basic/Sanitizers.def
++++ b/include/clang/Basic/Sanitizers.def
+@@ -50,6 +50,9 @@ SANITIZER("memory", Memory)
+ // ThreadSanitizer
+ SANITIZER("thread", Thread)
+ 
++// TypeSan
++SANITIZER("typesan", TypeSan)
++
+ // LeakSanitizer
+ SANITIZER("leak", Leak)
+ 
+diff --git a/include/clang/Driver/SanitizerArgs.h b/include/clang/Driver/SanitizerArgs.h
+index 072ddee..9bf6435 100644
+--- a/include/clang/Driver/SanitizerArgs.h
++++ b/include/clang/Driver/SanitizerArgs.h
+@@ -46,6 +46,8 @@ class SanitizerArgs {
+   bool needsSharedAsanRt() const { return AsanSharedRuntime; }
+   bool needsTsanRt() const { return Sanitizers.has(SanitizerKind::Thread); }
+   bool needsMsanRt() const { return Sanitizers.has(SanitizerKind::Memory); }
++  bool needsTypeSanRt() const { return Sanitizers.has(SanitizerKind::TypeSan); }
++  bool needsMetallocRt() const { return Sanitizers.has(SanitizerKind::TypeSan); }
+   bool needsLsanRt() const {
+     return Sanitizers.has(SanitizerKind::Leak) &&
+            !Sanitizers.has(SanitizerKind::Address);
+diff --git a/lib/CodeGen/BackendUtil.cpp b/lib/CodeGen/BackendUtil.cpp
+index 9727fc9..4d2bcaf 100644
+--- a/lib/CodeGen/BackendUtil.cpp
++++ b/lib/CodeGen/BackendUtil.cpp
+@@ -178,6 +178,15 @@ static void addBoundsCheckingPass(const PassManagerBuilder &Builder,
+   PM.add(createBoundsCheckingPass());
+ }
+ 
++static void addTypeSanPass(const PassManagerBuilder &Builder,
++                                    PassManagerBase &PM) {
++   PM.add(createTypeSanPass());
++}
++
++static void addTypeSanTreePass(const PassManagerBuilder &Builder,
++                                    PassManagerBase &PM) {
++   PM.add(createTypeSanTreePass());
++}
+ static void addSanitizerCoveragePass(const PassManagerBuilder &Builder,
+                                      legacy::PassManagerBase &PM) {
+   const PassManagerBuilderWrapper &BuilderWrapper =
+@@ -404,6 +413,18 @@ void EmitAssemblyHelper::CreatePasses(FunctionInfoIndex *FunctionIndex) {
+                            addDataFlowSanitizerPass);
+   }
+ 
++  
++  if (LangOpts.Sanitize.has(SanitizerKind::TypeSan)) {
++    PMBuilder.addExtension(PassManagerBuilder::EP_ModuleOptimizerEarly,
++                           addTypeSanTreePass);
++    PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
++                           addTypeSanTreePass);
++    PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
++                           addTypeSanPass);
++    PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
++                           addTypeSanPass);
++  }
++
+   // Set up the per-function pass manager.
+   legacy::FunctionPassManager *FPM = getPerFunctionPasses();
+   if (CodeGenOpts.VerifyModule)
+@@ -616,6 +637,10 @@ bool EmitAssemblyHelper::AddEmitPasses(BackendAction Action,
+   if (CodeGenOpts.OptimizationLevel > 0)
+     PM->add(createObjCARCContractPass());
+ 
++  // Add passes to reorganize memory layout for metadata tracking
++  if (LangOpts.Sanitize.has(SanitizerKind::TypeSan))
++    PM->add(createMetaStackPass());
++
+   if (TM->addPassesToEmitFile(*PM, OS, CGFT,
+                               /*DisableVerify=*/!CodeGenOpts.VerifyModule)) {
+     Diags.Report(diag::err_fe_unable_to_interface_with_target);
+diff --git a/lib/CodeGen/CGClass.cpp b/lib/CodeGen/CGClass.cpp
+index 8a82be9..2217ac3 100644
+--- a/lib/CodeGen/CGClass.cpp
++++ b/lib/CodeGen/CGClass.cpp
+@@ -2516,6 +2516,152 @@ void CodeGenFunction::EmitVTablePtrCheckForCall(const CXXRecordDecl *RD,
+   EmitVTablePtrCheck(RD, VTable, TCK, Loc);
+ }
+ 
++// crc32 bit
++// Reverses (reflects) bits in a 32-bit word.
++unsigned int crc32c(unsigned char *message) {
++	int i, j;
++	unsigned int byte, crc, mask;
++	static unsigned int table[256];
++
++	/* Set up the table, if necessary. */
++
++	if (table[1] == 0) {
++		for (byte = 0; byte <= 255; byte++) {
++			crc = byte;
++			for (j = 7; j >= 0; j--) {    // Do eight times.
++				mask = -(crc & 1);
++				crc = (crc >> 1) ^ (0xEDB88320 & mask);
++			}
++			table[byte] = crc;
++		}
++	}
++
++	/* Through with table setup, now calculate the CRC. */
++
++	i = 0;
++	crc = 0xFFFFFFFF;
++	while ((byte = message[i]) != 0) {
++		crc = (crc >> 8) ^ table[(crc ^ byte) & 0xFF];
++		i = i + 1;
++	}
++	return ~crc;
++}
++
++uint64_t crc64c(unsigned char *message) {
++	int i, j;
++	unsigned int byte;
++	uint64_t crc, mask;
++	static uint64_t table[256];
++
++	/* Set up the table, if necessary. */
++
++	if (table[1] == 0) {
++		for (byte = 0; byte <= 255; byte++) {
++			crc = byte;
++			for (j = 7; j >= 0; j--) {    // Do eight times.
++				mask = -(crc & 1);
++				crc = (crc >> 1) ^ (0xC96C5795D7870F42UL & mask);
++			}
++			table[byte] = crc;
++		}
++	}
++
++	/* Through with table setup, now calculate the CRC. */
++
++	i = 0;
++	crc = 0xFFFFFFFFFFFFFFFFUL;
++	while ((byte = message[i]) != 0) {
++		crc = (crc >> 8) ^ table[(crc ^ byte) & 0xFF];
++		i = i + 1;
++	}
++	return ~crc;
++}
++
++uint64_t GetHashValue(std::string str)
++{
++	unsigned char *className = new unsigned char[str.length() + 1];
++	strcpy((char *)className, str.c_str());
++
++	return crc64c(className);
++}
++
++void remove_useless_str(std::string& str) {
++
++	std::string::size_type i;
++
++	std::string basesuffix = ".base";
++
++	while( (i =str.find("*")) != std::string::npos) {
++		str.erase(i, 1);
++	}
++
++	while( (i =str.find("'")) != std::string::npos) {
++		str.erase(i, 1);
++	}
++
++	i = str.find(basesuffix);
++
++	if (i != std::string::npos)
++		str.erase(i, basesuffix.length());
++}
++
++void CodeGenFunction::EmitTypeSanCheckForCast(QualType T,
++                                                llvm::Value *Base,
++                                                bool MayBeNull,
++                                                CFITypeCheckKind TCK,
++                                                SourceLocation Loc) {
++
++	auto *ClassTy = T->getAs<RecordType>();
++	if (!ClassTy)
++		return;
++
++	const CXXRecordDecl *ClassDecl = cast<CXXRecordDecl>(ClassTy->getDecl());
++	if (ClassDecl->isCompleteDefinition() && ClassDecl && ClassDecl->hasDefinition() && !ClassDecl->isAnonymousStructOrUnion()) {
++		llvm::Constant *StaticData[] = {
++			EmitCheckSourceLocation(Loc),
++		};
++
++		auto &layout = getTypes().getCGRecordLayout(ClassDecl);
++		std::string dstStr = layout.getLLVMType()->getName();
++		remove_useless_str(dstStr);
++		uint64_t dstValue = GetHashValue(dstStr);
++		llvm::Value *cast =  llvm::ConstantInt::get(Int64Ty, dstValue);
++		llvm::Value *DynamicArgs[] = { Base, cast };
++
++		TypeSanEmitCheck("__type_casting_verification", StaticData,
++				DynamicArgs, dstStr, dstValue);
++	}
++}
++
++void CodeGenFunction::EmitTypeSanCheckForChangingCast(QualType T,
++                                                llvm::Value *Base,
++                                                llvm::Value *Derived,
++                                                bool MayBeNull,
++                                                CFITypeCheckKind TCK,
++                                                SourceLocation Loc) {
++
++	auto *ClassTy = T->getAs<RecordType>();
++	if (!ClassTy)
++		return;
++
++	const CXXRecordDecl *ClassDecl = cast<CXXRecordDecl>(ClassTy->getDecl());
++	if (ClassDecl->isCompleteDefinition() && ClassDecl && ClassDecl->hasDefinition() && !ClassDecl->isAnonymousStructOrUnion()) {
++		llvm::Constant *StaticData[] = {
++			EmitCheckSourceLocation(Loc),
++		};
++
++		auto &layout = getTypes().getCGRecordLayout(ClassDecl);
++		std::string dstStr = layout.getLLVMType()->getName();
++		remove_useless_str(dstStr);
++		uint64_t dstValue = GetHashValue(dstStr);
++		llvm::Value *cast =  llvm::ConstantInt::get(Int64Ty, dstValue);
++		llvm::Value *DynamicArgs[] = { Base, Derived, cast };
++
++		TypeSanEmitCheck("__changing_type_casting_verification", StaticData,
++				DynamicArgs, dstStr, dstValue);
++	}
++}
++
+ void CodeGenFunction::EmitVTablePtrCheckForCast(QualType T,
+                                                 llvm::Value *Derived,
+                                                 bool MayBeNull,
+diff --git a/lib/CodeGen/CGExpr.cpp b/lib/CodeGen/CGExpr.cpp
+index 4a0f149..c2e1355 100644
+--- a/lib/CodeGen/CGExpr.cpp
++++ b/lib/CodeGen/CGExpr.cpp
+@@ -2446,6 +2446,53 @@ static void emitCheckHandlerCall(CodeGenFunction &CGF,
+   }
+ }
+ 
++void CodeGenFunction::TypeSanEmitCheck(
++//    ArrayRef<std::pair<llvm::Value *, SanitizerMask>> Checked,
++    StringRef FunctionName, ArrayRef<llvm::Constant *> StaticArgs,
++    ArrayRef<llvm::Value *> DynamicArgs,
++    std::string dstStr,
++    uint64_t dstValue) {
++  int blacklisted;
++
++  blacklisted = CGM.getContext().getSanitizerBlacklist().isBlacklistedFunction(CurFn->getName()) ? 1 : 0;
++  if (blacklisted) return;
++
++  llvm::Constant *Info = llvm::ConstantStruct::getAnon(StaticArgs);
++  auto *InfoPtr =
++      new llvm::GlobalVariable(CGM.getModule(), Info->getType(), false,
++                               llvm::GlobalVariable::PrivateLinkage, Info);
++  InfoPtr->setUnnamedAddr(true);
++  CGM.getSanitizerMetadata()->disableSanitizerForGlobal(InfoPtr);
++
++  SmallVector<llvm::Value *, 4> Args;
++  SmallVector<llvm::Type *, 4> ArgTypes;
++  Args.reserve(DynamicArgs.size() + 1);
++  ArgTypes.reserve(DynamicArgs.size() + 1);
++
++  // Handler functions take an i8* pointing to the (handler-specific) static
++  // information block, followed by a sequence of intptr_t arguments
++  // representing operand values.
++  //Args.push_back(Builder.CreateBitCast(InfoPtr, Int8PtrTy));
++  //ArgTypes.push_back(Int8PtrTy);
++  for (size_t i = 0, n = DynamicArgs.size(); i != n; ++i) {
++    Args.push_back(EmitCheckValue(DynamicArgs[i]));
++    ArgTypes.push_back(IntPtrTy);
++  }
++
++  llvm::AttrBuilder B;
++  B.addAttribute(llvm::Attribute::UWTable);
++
++  llvm::FunctionType *FnType =
++    llvm::FunctionType::get(CGM.VoidTy, ArgTypes, false);
++
++  llvm::Value *Fn = CGM.CreateRuntimeFunction(
++    FnType, FunctionName,
++    llvm::AttributeSet::get(getLLVMContext(),
++                            llvm::AttributeSet::FunctionIndex, B));
++
++  EmitNounwindRuntimeCall(Fn, Args);
++}
++
+ void CodeGenFunction::EmitCheck(
+     ArrayRef<std::pair<llvm::Value *, SanitizerMask>> Checked,
+     StringRef CheckName, ArrayRef<llvm::Constant *> StaticArgs,
+@@ -3618,6 +3665,25 @@ LValue CodeGenFunction::EmitCastLValue(const CastExpr *E) {
+       EmitTypeCheck(TCK_DowncastReference, E->getExprLoc(),
+                     Derived.getPointer(), E->getType());
+ 
++    // Check bad-casting by TypeSan
++    if (SanOpts.has(SanitizerKind::TypeSan)) {
++      llvm::Value *NonVirtualOffset = CGM.GetNonVirtualBaseClassOffset(DerivedClassDecl, E->path_begin(), E->path_end());
++      if (!NonVirtualOffset) {
++        EmitTypeSanCheckForCast(E->getType(),
++                                    LV.getAddress().getPointer(),
++                                    /*MayBeNull=*/false,
++                                    CFITCK_DerivedCast,
++                                    E->getLocStart());
++      } else {
++        EmitTypeSanCheckForChangingCast(E->getType(), 
++                                    LV.getAddress().getPointer(),
++                                    Derived.getPointer(),
++                                    /*MayBeNull=*/false,
++                                    CFITCK_DerivedCast,
++                                    E->getLocStart());
++      }
++    }
++
+     if (SanOpts.has(SanitizerKind::CFIDerivedCast))
+       EmitVTablePtrCheckForCast(E->getType(), Derived.getPointer(),
+                                 /*MayBeNull=*/false,
+diff --git a/lib/CodeGen/CGExprScalar.cpp b/lib/CodeGen/CGExprScalar.cpp
+index 540e01f..e7c530b 100644
+--- a/lib/CodeGen/CGExprScalar.cpp
++++ b/lib/CodeGen/CGExprScalar.cpp
+@@ -1442,6 +1442,26 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
+                                     CodeGenFunction::CFITCK_DerivedCast,
+                                     CE->getLocStart());
+ 
++    if (CGF.SanOpts.has(SanitizerKind::TypeSan))
++    { 
++      llvm::Value *NonVirtualOffset = CGF.CGM.GetNonVirtualBaseClassOffset(DerivedClassDecl, CE->path_begin(), CE->path_end());
++      if (!NonVirtualOffset) {
++        CGF.EmitTypeSanCheckForCast(DestTy->getPointeeType(),
++                                    Base.getPointer(),
++                                    /*MayBeNull=*/false,
++                                    CodeGenFunction::CFITCK_DerivedCast,
++                                    CE->getLocStart());
++      } else {
++        CGF.EmitTypeSanCheckForChangingCast(DestTy->getPointeeType(),
++                                    Base.getPointer(),
++                                    Derived.getPointer(),
++                                    /*MayBeNull=*/false,
++                                    CodeGenFunction::CFITCK_DerivedCast,
++                                    CE->getLocStart());
++      }
++    }
++    
++
+     return Derived.getPointer();
+   }
+   case CK_UncheckedDerivedToBase:
+diff --git a/lib/CodeGen/CodeGenFunction.h b/lib/CodeGen/CodeGenFunction.h
+index 85d5f7a..3e6c089 100644
+--- a/lib/CodeGen/CodeGenFunction.h
++++ b/lib/CodeGen/CodeGenFunction.h
+@@ -3048,6 +3048,23 @@ public:
+                  StringRef CheckName, ArrayRef<llvm::Constant *> StaticArgs,
+                  ArrayRef<llvm::Value *> DynamicArgs);
+ 
++
++  /// \brief Emit a HexEmitCheck
++  void TypeSanEmitCheck(StringRef CheckName, ArrayRef<llvm::Constant *> StaticArgs,
++                 ArrayRef<llvm::Value *> DynamicArgs,
++		 std::string dstStr,
++		 uint64_t dstValue);
++  
++  /// \brief Emit a HexEmitTypeSanCheckerForCast
++  void EmitTypeSanCheckForCast(QualType T, llvm::Value *Base,
++                                 bool MayBeNull, CFITypeCheckKind TCK,
++                                 SourceLocation Loc);
++  
++  /// \brief Emit a HexEmitTypeSanCheckerForChangingCast
++  void EmitTypeSanCheckForChangingCast(QualType T, llvm::Value *Base, llvm::Value *Derived,
++                                 bool MayBeNull, CFITypeCheckKind TCK,
++                                 SourceLocation Loc);
++
+   /// \brief Emit a slow path cross-DSO CFI check which calls __cfi_slowpath
+   /// if Cond if false.
+   void EmitCfiSlowPathCheck(SanitizerMask Kind, llvm::Value *Cond,
+diff --git a/lib/CodeGen/CodeGenTypes.cpp b/lib/CodeGen/CodeGenTypes.cpp
+index 554f9ff..0b31b14 100644
+--- a/lib/CodeGen/CodeGenTypes.cpp
++++ b/lib/CodeGen/CodeGenTypes.cpp
+@@ -49,26 +49,47 @@ void CodeGenTypes::addRecordTypeName(const RecordDecl *RD,
+                                      StringRef suffix) {
+   SmallString<256> TypeName;
+   llvm::raw_svector_ostream OS(TypeName);
+-  OS << RD->getKindName() << '.';
++  SmallString<256> TypeNameRtti;
++  llvm::raw_svector_ostream OSR(TypeNameRtti);
+   
+   // Name the codegen type after the typedef name
+   // if there is no tag type name available
+   if (RD->getIdentifier()) {
+     // FIXME: We should not have to check for a null decl context here.
+     // Right now we do it because the implicit Obj-C decls don't have one.
+-    if (RD->getDeclContext())
+-      RD->printQualifiedName(OS);
+-    else
++    if (RD->getDeclContext()) {
++      if (dyn_cast<CXXRecordDecl>(RD)) {
++        TheCXXABI.getMangleContext().mangleCXXRTTI(Context.getTypeDeclType(RD),
++                                                   OSR);
++	if (getContext().getSanitizerBlacklist().isBlacklistedType(OSR.str())) {
++		OS << "blacklistedtype" << '.';
++	} else {
++ 		OS << "trackedtype" << '.';
++	}
++        TheCXXABI.getMangleContext().mangleCXXRTTI(Context.getTypeDeclType(RD),
++                                                   OS);
++      }
++      else {
++        OS << RD->getKindName() << '.';
++        RD->printQualifiedName(OS);
++      }
++    }
++    else {
++      OS << RD->getKindName() << '.';
+       RD->printName(OS);
++    }
+   } else if (const TypedefNameDecl *TDD = RD->getTypedefNameForAnonDecl()) {
++    OS << RD->getKindName() << '.';
+     // FIXME: We should not have to check for a null decl context here.
+     // Right now we do it because the implicit Obj-C decls don't have one.
+     if (TDD->getDeclContext())
+       TDD->printQualifiedName(OS);
+     else
+       TDD->printName(OS);
+-  } else
++  } else {
++    OS << RD->getKindName() << '.';
+     OS << "anon";
++  }
+ 
+   if (!suffix.empty())
+     OS << suffix;
+diff --git a/lib/Driver/SanitizerArgs.cpp b/lib/Driver/SanitizerArgs.cpp
+index e4e6c02..eed0ebb 100644
+--- a/lib/Driver/SanitizerArgs.cpp
++++ b/lib/Driver/SanitizerArgs.cpp
+@@ -26,7 +26,7 @@ using namespace clang::driver;
+ using namespace llvm::opt;
+ 
+ enum : SanitizerMask {
+-  NeedsUbsanRt = Undefined | Integer | CFI,
++  NeedsUbsanRt = Undefined | Integer | CFI | TypeSan ,
+   NeedsUbsanCxxRt = Vptr | CFI,
+   NotAllowedWithTrap = Vptr,
+   RequiresPIE = DataFlow,
+diff --git a/lib/Driver/ToolChain.cpp b/lib/Driver/ToolChain.cpp
+index c1305f1..5aed078 100644
+--- a/lib/Driver/ToolChain.cpp
++++ b/lib/Driver/ToolChain.cpp
+@@ -684,6 +684,8 @@ SanitizerMask ToolChain::getSupportedSanitizers() const {
+   if (getTriple().getArch() == llvm::Triple::x86 ||
+       getTriple().getArch() == llvm::Triple::x86_64)
+     Res |= CFIICall;
++  if (getTriple().getArch() == llvm::Triple::x86_64)
++    Res |= TypeSan;
+   return Res;
+ }
+ 
+diff --git a/lib/Driver/Tools.cpp b/lib/Driver/Tools.cpp
+index 72e7caa..7933876 100644
+--- a/lib/Driver/Tools.cpp
++++ b/lib/Driver/Tools.cpp
+@@ -2945,6 +2945,14 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
+     NonWholeStaticRuntimes.push_back("stats");
+     RequiredSymbols.push_back("__sanitizer_stats_register");
+   }
++
++  if (SanArgs.needsTypeSanRt()) {
++    StaticRuntimes.push_back("typesan");
++  }
++
++  if (SanArgs.needsMetallocRt()) {
++    StaticRuntimes.push_back("metalloc");
++  }
+ }
+ 
+ // Should be called before we add system libraries (C++ ABI, libstdc++/libc++,

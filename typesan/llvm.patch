@@ -1,0 +1,2244 @@
+diff --git a/include/llvm/CodeGen/Passes.h b/include/llvm/CodeGen/Passes.h
+index 61b3ea8..d4d6d2b 100644
+--- a/include/llvm/CodeGen/Passes.h
++++ b/include/llvm/CodeGen/Passes.h
+@@ -675,6 +675,10 @@ namespace llvm {
+   /// This pass splits the stack into a safe stack and an unsafe stack to
+   /// protect against stack-based overflow vulnerabilities.
+   FunctionPass *createSafeStackPass(const TargetMachine *TM = nullptr);
++
++  /// This pass moves designated objects to a secondary tracked stack,
++  /// where metadata is available.
++  FunctionPass *createMetaStackPass(const TargetMachine *TM = nullptr);
+ } // End llvm namespace
+ 
+ /// Target machine pass initializer for passes with dependencies. Use with
+diff --git a/include/llvm/InitializePasses.h b/include/llvm/InitializePasses.h
+index 16f978a..f028f99 100644
+--- a/include/llvm/InitializePasses.h
++++ b/include/llvm/InitializePasses.h
+@@ -257,6 +257,7 @@ void initializeRegionViewerPass(PassRegistry&);
+ void initializeReversePostOrderFunctionAttrsPass(PassRegistry&);
+ void initializeRewriteStatepointsForGCPass(PassRegistry&);
+ void initializeSafeStackPass(PassRegistry&);
++void initializeMetaStackPass(PassRegistry&);
+ void initializeSCCPPass(PassRegistry&);
+ void initializeSROALegacyPassPass(PassRegistry&);
+ void initializeSROA_DTPass(PassRegistry&);
+@@ -324,6 +325,8 @@ void initializeLoopLoadEliminationPass(PassRegistry&);
+ void initializeFunctionImportPassPass(PassRegistry &);
+ void initializeLoopVersioningPassPass(PassRegistry &);
+ void initializeWholeProgramDevirtPass(PassRegistry &);
++void initializeTypeSanPass(PassRegistry&);
++void initializeTypeSanTreePass(PassRegistry&);
+ }
+ 
+ #endif
+diff --git a/include/llvm/LinkAllPasses.h b/include/llvm/LinkAllPasses.h
+index 158b2d0..31a00eb 100644
+--- a/include/llvm/LinkAllPasses.h
++++ b/include/llvm/LinkAllPasses.h
+@@ -143,6 +143,7 @@ namespace {
+       (void) llvm::createRegionViewerPass();
+       (void) llvm::createSCCPPass();
+       (void) llvm::createSafeStackPass();
++      (void) llvm::createMetaStackPass();
+       (void) llvm::createScalarReplAggregatesPass();
+       (void) llvm::createSingleLoopExtractorPass();
+       (void) llvm::createStripSymbolsPass();
+diff --git a/include/llvm/Transforms/Instrumentation.h b/include/llvm/Transforms/Instrumentation.h
+index ad65e0d..f720d54 100644
+--- a/include/llvm/Transforms/Instrumentation.h
++++ b/include/llvm/Transforms/Instrumentation.h
+@@ -111,6 +111,12 @@ FunctionPass *createMemorySanitizerPass(int TrackOrigins = 0);
+ // Insert ThreadSanitizer (race detection) instrumentation
+ FunctionPass *createThreadSanitizerPass();
+ 
++// Insert TypeSan instrumenation
++ModulePass *createTypeSanPass();
++
++// Creat Class relation data
++ModulePass *createTypeSanTreePass();
++
+ // Insert DataFlowSanitizer (dynamic data flow analysis) instrumentation
+ ModulePass *createDataFlowSanitizerPass(
+     const std::vector<std::string> &ABIListFiles = std::vector<std::string>(),
+diff --git a/include/llvm/Transforms/Utils/TypeSanUtil.h b/include/llvm/Transforms/Utils/TypeSanUtil.h
+new file mode 100644
+index 0000000..e6edbf2
+--- /dev/null
++++ b/include/llvm/Transforms/Utils/TypeSanUtil.h
+@@ -0,0 +1,134 @@
++#ifndef LLVM_TRANSFORMS_UTILS_TYPESAN_H
++#define LLVM_TRANSFORMS_UTILS_TYPESAN_H
++
++#include <algorithm>
++#include <iostream>
++#include <fstream>
++#include <string>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <semaphore.h>
++#include <fcntl.h>
++
++using namespace llvm;
++using std::string;
++
++namespace llvm {
++
++	typedef std::list<std::pair<long, StructType*> > StructOffsetsTy;
++
++	class DataLayout;
++	class Function;
++	class TargetLibraryInfo;
++
++    class TypeSanLoggerClass {
++        std::map<uint64_t, string> hashMapping;
++        unsigned long staticDownCasts = 0;
++        unsigned long trackedStack = 0;
++        unsigned long trackedGlobal = 0;
++        unsigned long trackedHeap = 0;
++    public:
++        TypeSanLoggerClass() {
++        }
++        ~TypeSanLoggerClass() {
++            string logFile = "";
++            char *envVariable = getenv("TYPECHECK_LOGFILE");
++            if (envVariable != nullptr) {
++                logFile = envVariable;
++            }
++            if (logFile != "") {
++                sem_t *loggerSemaphore = sem_open("TYPECHECK_LOGGER_SEMAPHORE", O_CREAT, 0600, 1);
++                sem_wait(loggerSemaphore);
++                std::ifstream inputFile(logFile);
++                if (inputFile.is_open()) {
++                    string line;
++                    
++                    std::getline(inputFile, line);
++                    staticDownCasts += stoul(line);
++                    std::getline(inputFile, line);
++                    trackedStack += stoul(line);
++                    std::getline(inputFile, line);
++                    trackedGlobal += stoul(line);
++                    std::getline(inputFile, line);
++                    trackedHeap += stoul(line);
++                    
++                    while(1) {
++                        std::getline(inputFile, line);
++                        // If a line was successfully read
++                        if(inputFile.good()) {
++                            uint64_t hash = (uint64_t)stoul(line);
++                            std::getline(inputFile, line);
++                            hashMapping.insert(std::make_pair(hash, line));
++                        // No valid line read, meaning we reached the end of file
++                        } else {
++                            break;
++                        }
++                    }
++                    
++                    inputFile.close();
++                }
++                std::ofstream outputFile(logFile);
++                outputFile << staticDownCasts << std::endl;
++                outputFile << trackedStack << std::endl;
++                outputFile << trackedGlobal << std::endl;
++                outputFile << trackedHeap << std::endl;
++                for (auto &hashMappingEntry : hashMapping) {
++                    outputFile << hashMappingEntry.first << std::endl;
++                    outputFile << hashMappingEntry.second << std::endl;
++                }
++                outputFile.close();
++                sem_post(loggerSemaphore);
++                sem_close(loggerSemaphore);
++                sem_unlink("TYPECHECK_LOGGER_SEMAPHORE");
++            }
++        }
++        void addHash(uint64_t hashCode, string &name) {
++            hashMapping.insert(std::make_pair(hashCode, name));
++        }
++        void incStaticDownCast() {
++            staticDownCasts++;
++        }
++        void incTrackedStack() {
++            trackedStack++;
++        }
++        void incTrackedGlobal() {
++            trackedGlobal++;
++        }
++        void incTrackedHeap() {
++            trackedHeap++;
++        }
++        
++    };
++    
++    extern TypeSanLoggerClass TypeSanLogger;
++        
++	class TypeSanUtil {
++		public:
++			TypeSanUtil(const DataLayout &DL)
++				: DL(DL) {
++			}
++
++			Type *VoidTy;
++			Type *Int8PtrTy;
++			Type *Int32PtrTy;
++			Type *Int64PtrTy;
++			Type *IntptrTy;
++			Type *Int64Ty;
++			Type *Int32Ty;
++
++                        ArrayType *MetadataTy;
++			Constant *MetaPageTable;
++                        
++			void insertUpdateMetalloc(Module *SrcM, IRBuilder<> &Builder, Value *ptrValue, Type *allocationType, int alignment, unsigned long count, Value *size, string allocName);
++			bool interestingType(Type *rootType);
++			static uint64_t getHashCodeFromStruct(StructType *STy);
++
++			const DataLayout &DL;
++
++	};
++
++} // llvm namespace
++
++#endif  // LLVM_TRANSFORMS_UTILS_TYPESAN_H
++
+diff --git a/lib/Analysis/MemoryBuiltins.cpp b/lib/Analysis/MemoryBuiltins.cpp
+index b181292..670a4f2 100644
+--- a/lib/Analysis/MemoryBuiltins.cpp
++++ b/lib/Analysis/MemoryBuiltins.cpp
+@@ -87,8 +87,8 @@ static Function *getCalledFunction(const Value *V, bool LookThroughBitCast) {
+   if (!CS.getInstruction())
+     return nullptr;
+ 
+-  if (CS.isNoBuiltin())
+-    return nullptr;
++  //if (CS.isNoBuiltin())
++  //  return nullptr;
+ 
+   Function *Callee = CS.getCalledFunction();
+   if (!Callee || !Callee->isDeclaration())
+@@ -228,7 +228,7 @@ static Value *computeArraySize(const CallInst *CI, const DataLayout &DL,
+ ///  >1: Unique PointerType cannot be determined, return NULL.
+ PointerType *llvm::getMallocType(const CallInst *CI,
+                                  const TargetLibraryInfo *TLI) {
+-  assert(isMallocLikeFn(CI, TLI) && "getMallocType and not malloc call");
++  //assert(isMallocLikeFn(CI, TLI) && "getMallocType and not malloc call");
+ 
+   PointerType *MallocType = nullptr;
+   unsigned NumOfBitCastUses = 0;
+diff --git a/lib/CodeGen/CMakeLists.txt b/lib/CodeGen/CMakeLists.txt
+index 6ebde1a..8126741 100644
+--- a/lib/CodeGen/CMakeLists.txt
++++ b/lib/CodeGen/CMakeLists.txt
+@@ -76,6 +76,7 @@ add_llvm_library(LLVMCodeGen
+   MachineSSAUpdater.cpp
+   MachineTraceMetrics.cpp
+   MachineVerifier.cpp
++  MetaStack.cpp
+   MIRPrinter.cpp
+   MIRPrintingPass.cpp
+   OptimizePHIs.cpp
+diff --git a/lib/CodeGen/CodeGen.cpp b/lib/CodeGen/CodeGen.cpp
+index 3c2dc85..5d25156 100644
+--- a/lib/CodeGen/CodeGen.cpp
++++ b/lib/CodeGen/CodeGen.cpp
+@@ -69,6 +69,7 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
+   initializeStackMapLivenessPass(Registry);
+   initializeLiveDebugValuesPass(Registry);
+   initializeSafeStackPass(Registry);
++  initializeMetaStackPass(Registry);
+   initializeStackProtectorPass(Registry);
+   initializeStackSlotColoringPass(Registry);
+   initializeTailDuplicatePassPass(Registry);
+diff --git a/lib/CodeGen/MetaStack.cpp b/lib/CodeGen/MetaStack.cpp
+new file mode 100644
+index 0000000..529bb6b
+--- /dev/null
++++ b/lib/CodeGen/MetaStack.cpp
+@@ -0,0 +1,597 @@
++//===-- MetaStack.cpp - Tracked Object Stack Insertion ------------------------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This pass splits the stack into the safe stack (kept as-is for LLVM backend)
++// and the unsafe stack (explicitly allocated and managed through the runtime
++// support library).
++//
++// http://clang.llvm.org/docs/SafeStack.html
++//
++//===----------------------------------------------------------------------===//
++
++#include "llvm/ADT/Statistic.h"
++#include "llvm/ADT/Triple.h"
++#include "llvm/Analysis/ScalarEvolution.h"
++#include "llvm/Analysis/ScalarEvolutionExpressions.h"
++#include "llvm/CodeGen/Passes.h"
++#include "llvm/CodeGen/Passes.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DIBuilder.h"
++#include "llvm/IR/DataLayout.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/Intrinsics.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/Format.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Support/raw_os_ostream.h"
++#include "llvm/Target/TargetLowering.h"
++#include "llvm/Target/TargetSubtargetInfo.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "metastack"
++
++enum UnsafeStackPtrStorageVal { ThreadLocalUSP, SingleThreadUSP };
++
++static cl::opt<UnsafeStackPtrStorageVal> USPStorage("meta-stack-usp-storage",
++    cl::Hidden, cl::init(ThreadLocalUSP),
++    cl::desc("Type of storage for the unsafe stack pointer"),
++    cl::values(clEnumValN(ThreadLocalUSP, "thread-local",
++                          "Thread-local storage"),
++               clEnumValN(SingleThreadUSP, "single-thread",
++                          "Non-thread-local storage"),
++               clEnumValEnd));
++
++namespace llvm {
++
++STATISTIC(NumFunctions, "Total number of functions");
++STATISTIC(NumUnsafeStackFunctions, "Number of functions with unsafe stack");
++STATISTIC(NumUnsafeStackRestorePointsFunctions,
++          "Number of functions that use setjmp or exceptions");
++
++STATISTIC(NumAllocas, "Total number of allocas");
++STATISTIC(NumUnsafeStaticAllocas, "Number of unsafe static allocas");
++STATISTIC(NumUnsafeDynamicAllocas, "Number of unsafe dynamic allocas");
++STATISTIC(NumUnsafeByValArguments, "Number of unsafe byval arguments");
++STATISTIC(NumUnsafeStackRestorePoints, "Number of setjmps and landingpads");
++
++} // namespace llvm
++
++namespace {
++
++/// The SafeStack pass splits the stack of each function into the safe
++/// stack, which is only accessed through memory safe dereferences (as
++/// determined statically), and the unsafe stack, which contains all
++/// local variables that are accessed in ways that we can't prove to
++/// be safe.
++class MetaStack : public FunctionPass {
++  const TargetMachine *TM;
++  const TargetLoweringBase *TL;
++  const DataLayout *DL;
++
++  Type *StackPtrTy;
++  Type *IntPtrTy;
++  Type *Int32Ty;
++  Type *Int8Ty;
++
++  Value *UnsafeStackPtr = nullptr;
++
++  /// Unsafe stack alignment. Each stack frame must ensure that the stack is
++  /// aligned to this value. We need to re-align the unsafe stack if the
++  /// alignment of any object on the stack exceeds this value.
++  ///
++  /// 16 seems like a reasonable upper bound on the alignment of objects that we
++  /// might expect to appear on the stack on most common targets.
++  enum { StackAlignment = 64 };
++
++  /// \brief Build a value representing a pointer to the unsafe stack pointer.
++  Value *getOrCreateUnsafeStackPtr(IRBuilder<> &IRB, Function &F);
++
++  /// \brief Find all static allocas, dynamic allocas, return instructions and
++  /// stack restore points (exception unwind blocks and setjmp calls) in the
++  /// given function and append them to the respective vectors.
++  void findInsts(Function &F, SmallVectorImpl<AllocaInst *> &StaticAllocas,
++                 SmallVectorImpl<AllocaInst *> &DynamicAllocas,
++                 SmallVectorImpl<Argument *> &ByValArguments,
++                 SmallVectorImpl<ReturnInst *> &Returns,
++                 SmallVectorImpl<Instruction *> &StackRestorePoints);
++
++  /// \brief Calculate the allocation size of a given alloca. Returns 0 if the
++  /// size can not be statically determined.
++  uint64_t getStaticAllocaAllocationSize(const AllocaInst* AI);
++
++  /// \brief Allocate space for all static allocas in \p StaticAllocas,
++  /// replace allocas with pointers into the unsafe stack and generate code to
++  /// restore the stack pointer before all return instructions in \p Returns.
++  ///
++  /// \returns A pointer to the top of the unsafe stack after all unsafe static
++  /// allocas are allocated.
++  Value *moveStaticAllocasToUnsafeStack(IRBuilder<> &IRB, Function &F,
++                                        ArrayRef<AllocaInst *> StaticAllocas,
++                                        ArrayRef<Argument *> ByValArguments,
++                                        ArrayRef<ReturnInst *> Returns,
++                                        Instruction *BasePointer);
++
++  /// \brief Generate code to restore the stack after all stack restore points
++  /// in \p StackRestorePoints.
++  ///
++  /// \returns A local variable in which to maintain the dynamic top of the
++  /// unsafe stack if needed.
++  AllocaInst *
++  createStackRestorePoints(IRBuilder<> &IRB, Function &F,
++                           ArrayRef<Instruction *> StackRestorePoints,
++                           Value *StaticTop, bool NeedDynamicTop);
++
++  /// \brief Replace all allocas in \p DynamicAllocas with code to allocate
++  /// space dynamically on the unsafe stack and store the dynamic unsafe stack
++  /// top to \p DynamicTop if non-null.
++  void moveDynamicAllocasToUnsafeStack(Function &F, Value *UnsafeStackPtr,
++                                       AllocaInst *DynamicTop,
++                                       ArrayRef<AllocaInst *> DynamicAllocas);
++
++  bool IsTrackedStackAlloca(const Value *AllocaPtr, uint64_t AllocaSize);
++
++public:
++  static char ID; // Pass identification, replacement for typeid.
++  MetaStack(const TargetMachine *TM)
++      : FunctionPass(ID), TM(TM), TL(nullptr), DL(nullptr) {
++    initializeSafeStackPass(*PassRegistry::getPassRegistry());
++  }
++  MetaStack() : MetaStack(nullptr) {}
++
++  bool doInitialization(Module &M) override {
++    DL = &M.getDataLayout();
++
++    StackPtrTy = Type::getInt8PtrTy(M.getContext());
++    IntPtrTy = DL->getIntPtrType(M.getContext());
++    Int32Ty = Type::getInt32Ty(M.getContext());
++    Int8Ty = Type::getInt8Ty(M.getContext());
++
++    return false;
++  }
++
++  bool runOnFunction(Function &F) override;
++}; // class MetaStack
++
++uint64_t MetaStack::getStaticAllocaAllocationSize(const AllocaInst* AI) {
++  uint64_t Size = DL->getTypeAllocSize(AI->getAllocatedType());
++  if (AI->isArrayAllocation()) {
++    auto C = dyn_cast<ConstantInt>(AI->getArraySize());
++    if (!C)
++      return 0;
++    Size *= C->getZExtValue();
++  }
++  return Size;
++}
++
++/// Check whether a given allocation must be put on the tracked
++/// stack or not. Uses TrackedAlloca Metadata on instruction.
++bool MetaStack::IsTrackedStackAlloca(const Value *AllocaPtr, uint64_t AllocaSize) {
++  auto I = dyn_cast<Instruction>(AllocaPtr);
++  if (I && I->getMetadata("TrackedAlloca"))
++    return true;
++  return false;
++}
++
++Value *MetaStack::getOrCreateUnsafeStackPtr(IRBuilder<> &IRB, Function &F) {
++  // Check if there is a target-specific location for the unsafe stack pointer.
++  if (TL)
++    if (Value *V = TL->getSafeStackPointerLocation(IRB))
++      return V;
++
++  // Otherwise, assume the target links with compiler-rt, which provides a
++  // thread-local variable with a magic name.
++  Module &M = *F.getParent();
++  const char *UnsafeStackPtrVar = "__metastack_tracked_stack_ptr";
++  auto UnsafeStackPtr =
++      dyn_cast_or_null<GlobalVariable>(M.getNamedValue(UnsafeStackPtrVar));
++
++  bool UseTLS = USPStorage == ThreadLocalUSP;
++
++  if (!UnsafeStackPtr) {
++    auto TLSModel = UseTLS ?
++        GlobalValue::InitialExecTLSModel :
++        GlobalValue::NotThreadLocal;
++    // The global variable is not defined yet, define it ourselves.
++    // We use the initial-exec TLS model because we do not support the
++    // variable living anywhere other than in the main executable.
++    UnsafeStackPtr = new GlobalVariable(
++        M, StackPtrTy, false, GlobalValue::ExternalLinkage, nullptr,
++        UnsafeStackPtrVar, nullptr, TLSModel);
++  } else {
++    // The variable exists, check its type and attributes.
++    if (UnsafeStackPtr->getValueType() != StackPtrTy)
++      report_fatal_error(Twine(UnsafeStackPtrVar) + " must have void* type");
++    if (UseTLS != UnsafeStackPtr->isThreadLocal())
++      report_fatal_error(Twine(UnsafeStackPtrVar) + " must " +
++                         (UseTLS ? "" : "not ") + "be thread-local");
++  }
++  return UnsafeStackPtr;
++}
++
++void MetaStack::findInsts(Function &F,
++                          SmallVectorImpl<AllocaInst *> &StaticAllocas,
++                          SmallVectorImpl<AllocaInst *> &DynamicAllocas,
++                          SmallVectorImpl<Argument *> &ByValArguments,
++                          SmallVectorImpl<ReturnInst *> &Returns,
++                          SmallVectorImpl<Instruction *> &StackRestorePoints) {
++  for (Instruction &I : instructions(&F)) {
++    if (auto AI = dyn_cast<AllocaInst>(&I)) {
++      ++NumAllocas;
++
++      uint64_t Size = getStaticAllocaAllocationSize(AI);
++      if (!IsTrackedStackAlloca(AI, Size))
++        continue;
++
++      if (AI->isStaticAlloca()) {
++        ++NumUnsafeStaticAllocas;
++        StaticAllocas.push_back(AI);
++      } else {
++        ++NumUnsafeDynamicAllocas;
++        DynamicAllocas.push_back(AI);
++      }
++    } else if (auto RI = dyn_cast<ReturnInst>(&I)) {
++      Returns.push_back(RI);
++    } else if (auto CI = dyn_cast<CallInst>(&I)) {
++      // setjmps require stack restore.
++      if (CI->getCalledFunction() && CI->canReturnTwice())
++        StackRestorePoints.push_back(CI);
++    } else if (auto II = dyn_cast<IntrinsicInst>(&I)) {
++      if (II->getIntrinsicID() == Intrinsic::gcroot)
++        llvm::report_fatal_error(
++            "gcroot intrinsic not compatible with safestack attribute");
++    }
++  }
++  /*for (Argument &Arg : F.args()) {
++    if (!Arg.hasByValAttr())
++      continue;
++    uint64_t Size =
++        DL->getTypeStoreSize(Arg.getType()->getPointerElementType());
++    if (!IsTrackedStackAlloca(&Arg, Size))
++      continue;
++
++    ++NumUnsafeByValArguments;
++    ByValArguments.push_back(&Arg);
++  }*/
++}
++
++AllocaInst *
++MetaStack::createStackRestorePoints(IRBuilder<> &IRB, Function &F,
++                                    ArrayRef<Instruction *> StackRestorePoints,
++                                    Value *StaticTop, bool NeedDynamicTop) {
++  //assert(StaticTop && "The stack top isn't set.");
++
++  if (StackRestorePoints.empty())
++    return nullptr;
++  
++  // We need the current value of the shadow stack pointer to restore
++  // after longjmp or exception catching.
++
++  // FIXME: On some platforms this could be handled by the longjmp/exception
++  // runtime itself.
++
++  AllocaInst *DynamicTop = nullptr;
++  if (NeedDynamicTop) {
++    // If we also have dynamic alloca's, the stack pointer value changes
++    // throughout the function. For now we store it in an alloca.
++    DynamicTop = IRB.CreateAlloca(StackPtrTy, /*ArraySize=*/nullptr,
++                                  "tracked_stack_dynamic_ptr");
++    IRB.CreateStore(StaticTop, DynamicTop);
++  }
++
++  // Restore current stack pointer after longjmp/exception catch.
++  for (Instruction *I : StackRestorePoints) {
++    ++NumUnsafeStackRestorePoints;
++
++    // No tracked alloca's in this function
++    // Read the current value before the restore point
++    if (StaticTop == nullptr) {
++        IRB.SetInsertPoint(I);
++        UnsafeStackPtr = getOrCreateUnsafeStackPtr(IRB, F);
++        StaticTop = IRB.CreateLoad(UnsafeStackPtr, false, "tracked_stack_ptr");
++    }
++    
++    IRB.SetInsertPoint(I->getNextNode());
++    Value *CurrentTop = DynamicTop ? IRB.CreateLoad(DynamicTop) : StaticTop;
++    IRB.CreateStore(CurrentTop, UnsafeStackPtr);
++  }
++
++  return DynamicTop;
++}
++
++/// We explicitly compute and set the unsafe stack layout for all unsafe
++/// static alloca instructions. We save the unsafe "base pointer" in the
++/// prologue into a local variable and restore it in the epilogue.
++Value *MetaStack::moveStaticAllocasToUnsafeStack(
++    IRBuilder<> &IRB, Function &F, ArrayRef<AllocaInst *> StaticAllocas,
++    ArrayRef<Argument *> ByValArguments, ArrayRef<ReturnInst *> Returns,
++    Instruction *BasePointer) {
++  if (StaticAllocas.empty() && ByValArguments.empty())
++    return BasePointer;
++
++  DIBuilder DIB(*F.getParent());
++
++  // Compute maximum alignment among static objects on the unsafe stack.
++  unsigned MaxAlignment = StackAlignment;
++  for (Argument *Arg : ByValArguments) {
++    Type *Ty = Arg->getType()->getPointerElementType();
++    unsigned Align = std::max((unsigned)DL->getPrefTypeAlignment(Ty),
++                              Arg->getParamAlignment());
++    if (Align > MaxAlignment)
++      MaxAlignment = Align;
++  }
++  for (AllocaInst *AI : StaticAllocas) {
++    Type *Ty = AI->getAllocatedType();
++    unsigned Align =
++        std::max((unsigned)DL->getPrefTypeAlignment(Ty), AI->getAlignment());
++    if (Align > MaxAlignment)
++      MaxAlignment = Align;
++  }
++
++  if (MaxAlignment > StackAlignment) {
++    // Re-align the base pointer according to the max requested alignment.
++    assert(isPowerOf2_32(MaxAlignment));
++    IRB.SetInsertPoint(BasePointer->getNextNode());
++    BasePointer = cast<Instruction>(IRB.CreateIntToPtr(
++        IRB.CreateAnd(IRB.CreatePtrToInt(BasePointer, IntPtrTy),
++                      ConstantInt::get(IntPtrTy, ~uint64_t(MaxAlignment - 1))),
++        StackPtrTy));
++  }
++
++  int64_t StaticOffset = 0; // Current stack top.
++  IRB.SetInsertPoint(BasePointer->getNextNode());
++
++  for (Argument *Arg : ByValArguments) {
++    Type *Ty = Arg->getType()->getPointerElementType();
++
++    uint64_t Size = DL->getTypeStoreSize(Ty);
++    if (Size == 0)
++      Size = 1; // Don't create zero-sized stack objects.
++
++    // Ensure the object is properly aligned.
++    unsigned Align = std::max(std::max((unsigned)DL->getPrefTypeAlignment(Ty),
++                              Arg->getParamAlignment()), (unsigned)StackAlignment);
++
++    // Add alignment.
++    // NOTE: we ensure that BasePointer itself is aligned to >= Align.
++    StaticOffset += Size;
++    StaticOffset = alignTo(StaticOffset, Align);
++
++    Value *Off = IRB.CreateGEP(BasePointer, // BasePointer is i8*
++                               ConstantInt::get(Int32Ty, -StaticOffset));
++    Value *NewArg = IRB.CreateBitCast(Off, Arg->getType(),
++                                     Arg->getName() + ".unsafe-byval");
++
++    // Replace alloc with the new location.
++    replaceDbgDeclare(Arg, BasePointer, BasePointer->getNextNode(), DIB,
++                      /*Deref=*/true, -StaticOffset);
++    Arg->replaceAllUsesWith(NewArg);
++    IRB.SetInsertPoint(cast<Instruction>(NewArg)->getNextNode());
++    IRB.CreateMemCpy(Off, Arg, Size, Arg->getParamAlignment());
++  }
++
++  // Allocate space for every unsafe static AllocaInst on the unsafe stack.
++  for (AllocaInst *AI : StaticAllocas) {
++    IRB.SetInsertPoint(AI);
++
++    Type *Ty = AI->getAllocatedType();
++    uint64_t Size = getStaticAllocaAllocationSize(AI);
++    if (Size == 0)
++      Size = 1; // Don't create zero-sized stack objects.
++
++    // Ensure the object is properly aligned.
++    unsigned Align =
++        std::max(std::max((unsigned)DL->getPrefTypeAlignment(Ty), AI->getAlignment()), (unsigned)StackAlignment);
++
++    // Add alignment.
++    // NOTE: we ensure that BasePointer itself is aligned to >= Align.
++    StaticOffset += Size;
++    StaticOffset = alignTo(StaticOffset, Align);
++
++    Value *Off = IRB.CreateGEP(BasePointer, // BasePointer is i8*
++                               ConstantInt::get(Int32Ty, -StaticOffset));
++    Value *NewAI = IRB.CreateBitCast(Off, AI->getType(), AI->getName());
++    if (AI->hasName() && isa<Instruction>(NewAI))
++      cast<Instruction>(NewAI)->takeName(AI);
++
++    // Replace alloc with the new location.
++    replaceDbgDeclareForAlloca(AI, BasePointer, DIB, /*Deref=*/true, -StaticOffset);
++    AI->replaceAllUsesWith(NewAI);
++    AI->eraseFromParent();
++  }
++
++  // Re-align BasePointer so that our callees would see it aligned as
++  // expected.
++  // FIXME: no need to update BasePointer in leaf functions.
++  StaticOffset = alignTo(StaticOffset, StackAlignment);
++
++  // Update shadow stack pointer in the function epilogue.
++  IRB.SetInsertPoint(BasePointer->getNextNode());
++
++  Value *StaticTop =
++      IRB.CreateGEP(BasePointer, ConstantInt::get(Int32Ty, -StaticOffset),
++                    "tracked_stack_static_top");
++  IRB.CreateStore(StaticTop, UnsafeStackPtr);
++  return StaticTop;
++}
++
++void MetaStack::moveDynamicAllocasToUnsafeStack(
++    Function &F, Value *UnsafeStackPtr, AllocaInst *DynamicTop,
++    ArrayRef<AllocaInst *> DynamicAllocas) {
++  DIBuilder DIB(*F.getParent());
++
++  for (AllocaInst *AI : DynamicAllocas) {
++    IRBuilder<> IRB(AI);
++
++    // Compute the new SP value (after AI).
++    Value *ArraySize = AI->getArraySize();
++    if (ArraySize->getType() != IntPtrTy)
++      ArraySize = IRB.CreateIntCast(ArraySize, IntPtrTy, false);
++
++    Type *Ty = AI->getAllocatedType();
++    uint64_t TySize = DL->getTypeAllocSize(Ty);
++    Value *Size = IRB.CreateMul(ArraySize, ConstantInt::get(IntPtrTy, TySize));
++
++    Value *SP = IRB.CreatePtrToInt(IRB.CreateLoad(UnsafeStackPtr), IntPtrTy);
++    SP = IRB.CreateSub(SP, Size);
++
++    // Align the SP value to satisfy the AllocaInst, type and stack alignments.
++    unsigned Align = std::max(
++        std::max((unsigned)DL->getPrefTypeAlignment(Ty), AI->getAlignment()),
++        (unsigned)StackAlignment);
++
++    assert(isPowerOf2_32(Align));
++    Value *NewTop = IRB.CreateIntToPtr(
++        IRB.CreateAnd(SP, ConstantInt::get(IntPtrTy, ~uint64_t(Align - 1))),
++        StackPtrTy);
++
++    // Save the stack pointer.
++    IRB.CreateStore(NewTop, UnsafeStackPtr);
++    if (DynamicTop)
++      IRB.CreateStore(NewTop, DynamicTop);
++
++    Value *NewAI = IRB.CreatePointerCast(NewTop, AI->getType());
++    if (AI->hasName() && isa<Instruction>(NewAI))
++      NewAI->takeName(AI);
++
++    replaceDbgDeclareForAlloca(AI, NewAI, DIB, /*Deref=*/true);
++    AI->replaceAllUsesWith(NewAI);
++    AI->eraseFromParent();
++  }
++
++  if (!DynamicAllocas.empty()) {
++    // Now go through the instructions again, replacing stacksave/stackrestore.
++    for (inst_iterator It = inst_begin(&F), Ie = inst_end(&F); It != Ie;) {
++      Instruction *I = &*(It++);
++      auto II = dyn_cast<IntrinsicInst>(I);
++      if (!II)
++        continue;
++
++      if (II->getIntrinsicID() == Intrinsic::stacksave) {
++        IRBuilder<> IRB(II);
++        Instruction *LI = IRB.CreateLoad(UnsafeStackPtr);
++        LI->takeName(II);
++        II->replaceAllUsesWith(LI);
++        II->eraseFromParent();
++      } else if (II->getIntrinsicID() == Intrinsic::stackrestore) {
++        IRBuilder<> IRB(II);
++        Instruction *SI = IRB.CreateStore(II->getArgOperand(0), UnsafeStackPtr);
++        SI->takeName(II);
++        assert(II->use_empty());
++        II->eraseFromParent();
++      }
++    }
++  }
++}
++
++bool MetaStack::runOnFunction(Function &F) {
++  DEBUG(dbgs() << "[MetaStack] Function: " << F.getName() << "\n");
++
++  if (F.isDeclaration()) {
++    DEBUG(dbgs() << "[MetaStack]     function definition"
++                    " is not available\n");
++    return false;
++  }
++
++  TL = TM ? TM->getSubtargetImpl(F)->getTargetLowering() : nullptr;
++
++  ++NumFunctions;
++
++  SmallVector<AllocaInst *, 16> StaticAllocas;
++  SmallVector<AllocaInst *, 4> DynamicAllocas;
++  SmallVector<Argument *, 4> ByValArguments;
++  SmallVector<ReturnInst *, 4> Returns;
++
++  // Collect all points where stack gets unwound and needs to be restored
++  // This is only necessary because the runtime (setjmp and unwind code) is
++  // not aware of the unsafe stack and won't unwind/restore it prorerly.
++  // To work around this problem without changing the runtime, we insert
++  // instrumentation to restore the unsafe stack pointer when necessary.
++  SmallVector<Instruction *, 4> StackRestorePoints;
++
++  // Find all static and dynamic alloca instructions that must be moved to the
++  // unsafe stack, all return instructions and stack restore points.
++  findInsts(F, StaticAllocas, DynamicAllocas, ByValArguments, Returns,
++            StackRestorePoints);
++
++  if (StaticAllocas.empty() && DynamicAllocas.empty() &&
++      ByValArguments.empty() && StackRestorePoints.empty())
++    return false; // Nothing to do in this function.
++
++  if (!StaticAllocas.empty() || !DynamicAllocas.empty() ||
++      !ByValArguments.empty())
++    ++NumUnsafeStackFunctions; // This function has the unsafe stack.
++
++  if (!StackRestorePoints.empty())
++    ++NumUnsafeStackRestorePointsFunctions;
++
++  IRBuilder<> IRB(&F.front(), F.begin()->getFirstInsertionPt());
++  
++  UnsafeStackPtr = nullptr;
++  Instruction *BasePointer = nullptr;
++  if (!StaticAllocas.empty() || !DynamicAllocas.empty()) {
++    UnsafeStackPtr = getOrCreateUnsafeStackPtr(IRB, F);
++
++    // Load the current stack pointer (we'll also use it as a base pointer).
++    // FIXME: use a dedicated register for it ?
++    BasePointer = IRB.CreateLoad(UnsafeStackPtr, false, "tracked_stack_ptr");
++    assert(BasePointer->getType() == StackPtrTy);
++  }
++
++  // The top of the unsafe stack after all unsafe static allocas are allocated.
++  Value *StaticTop = moveStaticAllocasToUnsafeStack(IRB, F, StaticAllocas,
++                                                    ByValArguments, Returns,
++                                                    BasePointer);
++
++  // Safe stack object that stores the current unsafe stack top. It is updated
++  // as unsafe dynamic (non-constant-sized) allocas are allocated and freed.
++  // This is only needed if we need to restore stack pointer after longjmp
++  // or exceptions, and we have dynamic allocations.
++  // FIXME: a better alternative might be to store the unsafe stack pointer
++  // before setjmp / invoke instructions.
++  AllocaInst *DynamicTop = createStackRestorePoints(
++      IRB, F, StackRestorePoints, StaticTop, !DynamicAllocas.empty());
++
++  // Handle dynamic allocas.
++  moveDynamicAllocasToUnsafeStack(F, UnsafeStackPtr, DynamicTop,
++                                  DynamicAllocas);
++
++  // Restore the unsafe stack pointer before each return.
++  if (!StaticAllocas.empty() || !DynamicAllocas.empty()) {
++    for (ReturnInst *RI : Returns) {
++      IRB.SetInsertPoint(RI);
++      IRB.CreateStore(BasePointer, UnsafeStackPtr);
++    }
++  }
++
++  DEBUG(dbgs() << "[MetaStack]     tracked-stack applied\n");
++  return true;
++}
++
++} // anonymous namespace
++
++char MetaStack::ID = 0;
++INITIALIZE_TM_PASS_BEGIN(MetaStack, "meta-stack",
++                         "Metadata Stack instrumentation pass", false, false)
++INITIALIZE_TM_PASS_END(MetaStack, "meta-stack",
++                       "Metadata Stack instrumentation pass", false, false)
++
++FunctionPass *llvm::createMetaStackPass(const llvm::TargetMachine *TM) {
++  return new MetaStack(TM);
++}
+diff --git a/lib/Transforms/Instrumentation/CMakeLists.txt b/lib/Transforms/Instrumentation/CMakeLists.txt
+index 271e310..59bee54 100644
+--- a/lib/Transforms/Instrumentation/CMakeLists.txt
++++ b/lib/Transforms/Instrumentation/CMakeLists.txt
+@@ -9,6 +9,8 @@ add_llvm_library(LLVMInstrumentation
+   PGOInstrumentation.cpp
+   SanitizerCoverage.cpp
+   ThreadSanitizer.cpp
++  TypeSanPass.cpp
++  TypeSanTreePass.cpp
+ 
+   ADDITIONAL_HEADER_DIRS
+   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms
+diff --git a/lib/Transforms/Instrumentation/TypeSanPass.cpp b/lib/Transforms/Instrumentation/TypeSanPass.cpp
+new file mode 100644
+index 0000000..1038d33
+--- /dev/null
++++ b/lib/Transforms/Instrumentation/TypeSanPass.cpp
+@@ -0,0 +1,364 @@
++#include "llvm/Analysis/CallGraph.h"
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/IR/InstVisitor.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/MDBuilder.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Type.h"
++#include "llvm/Pass.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/Analysis/ConstantFolding.h"
++#include "llvm/Analysis/MemoryBuiltins.h"
++#include "llvm/Transforms/Utils/TypeSanUtil.h"
++
++#include <algorithm>
++#include <iostream>
++#include <string>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define MAX_NODE 1000
++#define MAX_PNUM 50
++#define MAX_NAME 500
++
++#define FDEBUG_LOG // print debugging information into the file
++
++using namespace llvm;
++using std::string;
++
++typedef std::list<std::pair<long, StructType*> > StructOffsetsTy;
++
++namespace {
++
++	struct TypeSan : public ModulePass {
++
++		static char ID;
++		TypeSan() : ModulePass(ID) {}
++
++		const DataLayout *DL;
++		TargetLibraryInfo *TLI;
++		CallGraph *CG;
++
++		Type *VoidTy;
++		Type *Int8PtrTy;
++		Type *Int32PtrTy;
++		Type *Int64PtrTy;
++		Type *IntptrTy;
++		Type *Int64Ty;
++		Type *Int32Ty;
++    		Type *Int1Ty;
++
++		FunctionType *VoidFTy;
++
++		ArrayType *MetadataTy;                
++
++		Constant *MetaPageTable;
++
++                std::map<Function*, bool> mayCastMap;
++                std::set<Function*> functionsVisitedForMayCast;
++                
++		///////////////////////
++		// Declare function 
++                //////////////////////
++
++		#ifdef FDEBUG_LOG
++		void write_flog(string result) {
++			FILE *op = fopen("pass_result.txt", "a");
++			fprintf(op, "%s\n", result.c_str());
++			fclose(op);
++		}
++		#endif
++
++		Instruction* findNextInstruction(Instruction *inst) {
++			BasicBlock::iterator it(inst);
++			++it;
++			if(it == inst->getParent()->end()) {
++				/* Inst is the last instruction in the basic block */
++				return NULL;
++			} else {
++				return &*it;
++			}
++		}
++		
++		void getAnalysisUsage(AnalysisUsage &Info) const {
++			Info.addRequired<CallGraphWrapperPass>();
++		}
++
++		bool doInitialization(Module &M) {
++
++			return true;
++		}
++
++		bool doFinalization(Module &M) {
++
++			return false;
++		}
++
++                bool mayCast(Function *F, std::set<Function*> &visited, bool *isComplete) {
++                    // Externals may cast
++                    if (F->isDeclaration()) {
++                        return true;
++                    }
++                    
++                    // Check previously processed
++                    auto mayCastIterator = mayCastMap.find(F);
++                    if (mayCastIterator != mayCastMap.end()) {
++                        return mayCastIterator->second;
++                    }
++                    
++                    visited.insert(F);
++                    
++                    bool isCurrentComplete = true;
++                    
++                    for (auto &I : *(*CG)[F]) {
++                        Function *calleeFunction = I.second->getFunction();
++                        // Default to true to avoid accidental bugs on API changes
++                        bool result = true;
++                        // Indirect call
++                        if (!calleeFunction) {
++                            result = true;
++                        // Recursion detected, do not process callee
++                        } else if (visited.count(calleeFunction)) {
++                            isCurrentComplete = false;
++                        // Explicit call to checker
++                        } else if (calleeFunction->getName().find("type_casting_verification") != StringRef::npos) {
++                            TypeSanLogger.incStaticDownCast();
++                            result = true;
++                        // Check recursively
++                        } else {
++                            bool isCalleeComplete;
++                            result = mayCast(calleeFunction, visited, &isCalleeComplete);
++                            // Forbid from caching if callee was not complete (due to recursion)
++                            isCurrentComplete &= isCalleeComplete;
++                        }
++                        // Found a potentialy cast, report true
++                        if (result) {
++                            // Cache and report even if it was incomplete
++                            // Missing traversal can never flip it to not found
++                            mayCastMap.insert(std::make_pair(F, true));
++                            *isComplete = true;
++                            return true;
++                        }
++                    }
++                    
++                    // No cast found anywhere, report false
++                    // Do not cache negative results if current traversal was not complete (due to recursion)
++                    /*if (isCurrentComplete) {
++                        mayCastMap.insert(std::make_pair(F, false));
++                    }*/
++                    // Report to caller that this traversal was incomplete
++                    *isComplete = isCurrentComplete;
++                    return false;
++                }
++		
++		virtual bool runOnModule(Module &M) {
++
++			Module *SrcM = &M;
++			// Need to keep method-local as it is reference (LLVM API limitations)
++			LLVMContext &Ctx = (M.getContext());
++			// Initialize members to be used in helpers
++			DL = &SrcM->getDataLayout();
++                        
++                        CG = &getAnalysis<CallGraphWrapperPass>().getCallGraph();
++                        
++			TypeSanUtil TypeUtil(*DL);
++
++			TypeUtil.VoidTy = Type::getInt64Ty(Ctx);
++			TypeUtil.Int8PtrTy = PointerType::getUnqual(Type::getInt8Ty(Ctx));
++			TypeUtil.Int32PtrTy = PointerType::getUnqual(Type::getInt32Ty(Ctx));
++			TypeUtil.Int64PtrTy = PointerType::getUnqual(Type::getInt64Ty(Ctx));
++			TypeUtil.IntptrTy = Type::getInt8PtrTy(Ctx);
++			TypeUtil.Int64Ty = Type::getInt64Ty(Ctx);
++			TypeUtil.Int32Ty = Type::getInt32Ty(Ctx);
++  
++			TypeUtil.MetadataTy = ArrayType::get(TypeUtil.Int64Ty, 2);
++			TypeUtil.MetaPageTable = ConstantInt::get(TypeUtil.Int64Ty, 0x400000000000);
++                        
++			TargetLibraryInfoImpl tlii;
++			TLI = new TargetLibraryInfo(tlii);
++			VoidTy = Type::getInt64Ty(Ctx);
++			Int8PtrTy = PointerType::getUnqual(Type::getInt8Ty(Ctx));
++			Int32PtrTy = PointerType::getUnqual(Type::getInt32Ty(Ctx));
++			Int64PtrTy = PointerType::getUnqual(Type::getInt64Ty(Ctx));
++			IntptrTy = Type::getInt8PtrTy(Ctx);
++			Int64Ty = Type::getInt64Ty(Ctx);
++			Int32Ty = Type::getInt32Ty(Ctx);
++			Int1Ty = Type::getInt1Ty(Ctx);
++
++                        mayCastMap.clear();
++                        functionsVisitedForMayCast.clear();
++                        
++                        //declare void @llvm.memcpy.p0i8.p0i8.i64(i8 *, i8 *, i64, i32, i1)
++                        Type *MemcpyParams[] = { Int8PtrTy, Int8PtrTy, Int64Ty };
++                        Function *MemcpyFunc = Intrinsic::getDeclaration(SrcM, Intrinsic::memcpy, MemcpyParams);
++                        
++			VoidFTy = FunctionType::get(Type::getVoidTy(Ctx), false);
++
++			MetadataTy = ArrayType::get(Int64Ty, 2);                      
++
++			Function *FGlobal = Function::Create(VoidFTy, GlobalValue::InternalLinkage,
++					"__init_global_object" + M.getName(), SrcM);
++
++			FGlobal->setUnnamedAddr(true);
++			FGlobal->setLinkage(GlobalValue::InternalLinkage);
++			FGlobal->addFnAttr(Attribute::NoInline);
++
++			BasicBlock *BBGlobal = BasicBlock::Create(Ctx, "entry", FGlobal);
++			IRBuilder<> BuilderGlobal(BBGlobal);
++
++			std::list<GlobalVariable *> trackedGlobals;
++
++			// Find interesting globalvariables
++			for (GlobalVariable &GV : M.globals()) {
++				if (GV.getName() == "llvm.global_ctors" ||
++					GV.getName() == "llvm.global_dtors" ||
++					GV.getName() == "llvm.global.annotations" ||
++					GV.getName() == "llvm.used") {
++					continue;
++				}
++				if (TypeUtil.interestingType(GV.getValueType())) {
++					trackedGlobals.push_back(&GV);
++				}
++			}
++
++			if (trackedGlobals.size() > 0) {
++                            Function *FMGlobal = (Function*)M.getOrInsertFunction("metalloc_init_globals", VoidTy, Int64Ty, nullptr);
++                            Value *FMGlobalParam[1] = { BuilderGlobal.CreatePtrToInt(*(trackedGlobals.begin()), Int64Ty) };
++                            BuilderGlobal.CreateCall(FMGlobal, FMGlobalParam);
++                        }
++			
++			// To save globalvariable information
++			for (GlobalVariable *GV : trackedGlobals) {
++                                        TypeSanLogger.incTrackedGlobal();
++					string allocName = "global:" + GV->getName().str();
++					TypeUtil.insertUpdateMetalloc(SrcM, BuilderGlobal, GV, GV->getValueType(), 3, 1, ConstantInt::get(Int64Ty, DL->getTypeAllocSize(GV->getValueType())), allocName);
++			}
++
++			BuilderGlobal.CreateRetVoid();
++
++			// to insert into GlobalCtor
++			appendToGlobalCtors(M, FGlobal, 0);
++
++			for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
++				if (F->empty() || F->getEntryBlock().empty() || F->getName().startswith("__init_global_object")) {
++					continue;
++				}
++				if (getenv("TYPECHECK_DISABLE_STACK_OPT") == nullptr) {
++					std::set<Function*> visitedFunctions;
++					bool tmp;
++					bool mayCurrentCast = mayCast(&*F, visitedFunctions, &tmp);
++					// Insert result into cache, since result is final at this point
++					mayCastMap.insert(std::make_pair(&*F, mayCurrentCast));
++					if (!mayCurrentCast) {
++						continue;
++					}
++				}
++				for (auto &a : F->args()) {
++					Argument *Arg = dyn_cast<Argument>(&a);
++					if (!Arg->hasByValAttr()) {
++						continue;
++					}
++					Type *ArgPointedTy = Arg->getType()->getPointerElementType();
++					if (TypeUtil.interestingType(ArgPointedTy)) {
++						unsigned long size = DL->getTypeStoreSize(ArgPointedTy);
++                                                IRBuilder<> B(&*(F->getEntryBlock().getFirstInsertionPt()));
++                                                Value *NewAlloca = B.CreateAlloca(ArgPointedTy);
++                                                Arg->replaceAllUsesWith(NewAlloca);
++                                                Value *Src = B.CreatePointerCast(Arg, Int8PtrTy);
++                                                Value *Dst = B.CreatePointerCast(NewAlloca, Int8PtrTy);
++                                                Value *Param[5] = { Dst, Src, ConstantInt::get(Int64Ty, size), 
++                                                        ConstantInt::get(Int32Ty, 1), ConstantInt::get(Int1Ty, 0) };
++                                                B.CreateCall(MemcpyFunc, Param);
++					}
++				}
++				std::list<AllocaInst *> trackedAllocas;
++				for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
++					BasicBlock& b = *BB;
++
++					for (BasicBlock::iterator i = b.begin(), ie = b.end(); i != ie; ++i) {
++
++						IRBuilder<> Builder(&*i);
++
++						if (AllocaInst *AI = dyn_cast<AllocaInst>(&*i)) {
++							if (TypeUtil.interestingType(AI->getAllocatedType())) {
++								trackedAllocas.push_back(AI);
++							}
++						}
++					}
++				}
++
++				int index = 0;
++				Function *index_func = nullptr;
++				for (AllocaInst *AI : trackedAllocas) {
++					Instruction *next = findNextInstruction(AI);
++					IRBuilder<> Builder(next);
++					{
++						if (index_func == AI->getFunction()) {
++							index++;
++						} else {
++							index = 0;
++							index_func = AI->getFunction();
++						}
++						string allocName = "stack:" + AI->getFunction()->getName().str() + ":" + std::to_string(index);
++						
++                                                TypeSanLogger.incTrackedStack();
++						MDNode *node = MDNode::get(Ctx, MDString::get(Ctx, "trackedalloca"));
++						AI->setMetadata("TrackedAlloca", node);
++                        if (ConstantInt *constantSize = dyn_cast<ConstantInt>(AI->getArraySize())) {
++    						TypeUtil.insertUpdateMetalloc(SrcM, Builder, AI, AI->getAllocatedType(), 6, constantSize->getZExtValue(), 
++                                ConstantExpr::getMul(ConstantInt::get(Int64Ty, constantSize->getZExtValue()), ConstantInt::get(Int64Ty, DL->getTypeAllocSize(AI->getAllocatedType()))), allocName);
++                        } else {
++                        			Value *arraySize = AI->getArraySize();
++                        			if (arraySize->getType() != Int64Ty) {
++							arraySize = Builder.CreateIntCast(arraySize, Int64Ty, false);
++                        			}
++    						TypeUtil.insertUpdateMetalloc(SrcM, Builder, AI, AI->getAllocatedType(), 6, 0, 
++                                Builder.CreateMul(arraySize, ConstantInt::get(Int64Ty, DL->getTypeAllocSize(AI->getAllocatedType()))), allocName);
++                        }
++					}
++				}
++			}
++
++			return false;
++		}
++
++		virtual bool runOnFunction(Function &F) {
++
++			return false;
++		}
++
++		bool runOnBasicBlock(BasicBlock &BB) {
++
++			return true;
++		}
++	};
++}
++
++//register pass
++char TypeSan::ID = 0;
++
++INITIALIZE_PASS_BEGIN(TypeSan, "TypeSan",
++                "TypeUtilPass: fast type safety for C++ programs.",
++                false, false)
++INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
++INITIALIZE_PASS_END(TypeSan, "TypeSan",
++                "TypeSanPass: fast type safety for C++ programs.",
++                false, false)
++
++ModulePass *llvm::createTypeSanPass() {
++  return new TypeSan();
++}
++
+diff --git a/lib/Transforms/Instrumentation/TypeSanTreePass.cpp b/lib/Transforms/Instrumentation/TypeSanTreePass.cpp
+new file mode 100644
+index 0000000..71b1915
+--- /dev/null
++++ b/lib/Transforms/Instrumentation/TypeSanTreePass.cpp
+@@ -0,0 +1,453 @@
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/IR/InstVisitor.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/MDBuilder.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Type.h"
++#include "llvm/Pass.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/Analysis/ConstantFolding.h"
++#include "llvm/Analysis/MemoryBuiltins.h"
++#include "llvm/Transforms/Utils/TypeSanUtil.h"
++
++#include <algorithm>
++#include <iostream>
++#include <string>
++#include <cxxabi.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define FDEBUG_LOG // print debugging information into the file
++
++using namespace llvm;
++using std::string;
++
++namespace {
++
++	struct TypeSanTree : public ModulePass {
++
++		static char ID;
++		TypeSanTree() : ModulePass(ID) {}
++
++		LLVMContext *Context;
++
++		Type *VoidTy;
++		Type *Int8PtrTy;
++		Type *Int32PtrTy;
++		Type *Int64PtrTy;
++		Type *IntptrTy;
++		Type *Int64Ty;
++		Type *Int32Ty;
++
++
++                struct ClassInheritanceInfo {
++
++                    StructType *type;
++                    bool didProcessFakeHashesBottomUp;
++                    bool didProcessFakeHashesTopDown;
++
++                    ClassInheritanceInfo *parent;
++                    std::vector<ClassInheritanceInfo*> phantomChildren;
++                    
++                    uint64_t classHash;
++                    std::vector<uint64_t> parentHashes;
++                    std::vector<uint64_t> fakeParentHashes;
++                        
++                    ClassInheritanceInfo(StructType *type) : type(type),
++                            didProcessFakeHashesBottomUp(false),
++                            didProcessFakeHashesTopDown(false),
++                            parent(nullptr) {
++                        classHash = TypeSanUtil::getHashCodeFromStruct(type);
++                    }
++                    
++                    void recursiveProcessFakeParentsBottomUp() {
++                        if (this->didProcessFakeHashesBottomUp)
++                            return;
++                        for (ClassInheritanceInfo *childInfo : this->phantomChildren) {
++                            childInfo->recursiveProcessFakeParentsBottomUp();
++                            // Use set to ensure uniqueness of hashes, without affecting ordering
++                            // Duplicate might occur ???
++                            std::set<uint64_t> currentHashes(this->fakeParentHashes.begin(), this->fakeParentHashes.end());
++                            for (uint64_t hash : childInfo->fakeParentHashes) {
++                                auto tryInsertParent = currentHashes.insert(hash);
++                                if (tryInsertParent.second) {
++                                    this->fakeParentHashes.push_back(hash);
++                                }
++                            }
++                        }
++                        this->didProcessFakeHashesBottomUp = true;
++                    }
++                    
++                    void recursiveProcessFakeParentsTopDown() {
++                        if (this->didProcessFakeHashesTopDown)
++                            return;
++                        ClassInheritanceInfo *parentInfo = this->parent;
++                        if (parentInfo != nullptr) {
++                            parentInfo->recursiveProcessFakeParentsTopDown();
++                            // Use set to ensure uniqueness of hashes, without affecting ordering
++                            // Duplicate might occur ???
++                            std::set<uint64_t> currentHashes(this->fakeParentHashes.begin(), this->fakeParentHashes.end());
++                            for (uint64_t hash : parentInfo->fakeParentHashes) {
++                                auto tryInsertParent = currentHashes.insert(hash);
++                                if (tryInsertParent.second) {
++                                    this->fakeParentHashes.push_back(hash);
++                                }
++                            }
++                        }
++                        this->didProcessFakeHashesTopDown = true;
++                    }
++		};
++
++                std::map<StructType*, ClassInheritanceInfo*> classInfoMap;
++
++		///////////////////////
++		// Declare function 
++                //////////////////////
++
++		#ifdef FDEBUG_LOG
++		void write_flog(string result) {
++
++			FILE *op = fopen("pass_result.txt", "a");
++			fprintf(op, "%s\n", result.c_str());
++			fclose(op);
++
++		}
++		#endif
++
++		TargetLibraryInfo *tli;
++		typedef std::list<std::pair<long, StructType*> > StructOffsetsTy;
++		const DataLayout *DL;
++
++                bool isNewCall(Value *val) {
++                        if(isAllocationFn(val, this->tli) && 
++                            (isMallocLikeFn(val, this->tli) || isCallocLikeFn(val, this->tli) || !isAllocLikeFn(val, this->tli))) {
++                                return true;
++                        }
++
++                        return false;
++                }
++
++                bool isFreeCallCheck(Value *val) {
++                        CallInst *free = isFreeCall(val, this->tli);
++                        if(free) {
++                                return true;
++                        }
++
++                        return false;
++
++                }
++
++                Instruction* findNextInstruction(Instruction *inst) {
++                        BasicBlock::iterator it(inst);
++                        ++it;
++                        if(it == inst->getParent()->end()) {
++                                /* Inst is the last instruction in the basic block */
++                                return NULL;
++                        } else {
++                                return &*it;
++                        }
++                }
++
++                void getAnalysisUsage(AnalysisUsage &AU) const override {
++                    AU.addRequired<TargetLibraryInfoWrapperPass>();
++                }
++
++
++		////////////////////////////////
++
++		bool doInitialization(Module &M) {
++
++			return true;
++		}
++
++		bool doFinalization(Module &M) {
++
++			return false;
++		}
++
++                ClassInheritanceInfo *recursiveProcessType(StructType *STy) {
++                    if(STy->isLiteral() || STy->isOpaque()) {
++                        return nullptr;
++                    }
++                    // Already processed, return it as it is
++                    auto classIt = classInfoMap.find(STy);
++                    if (classIt != classInfoMap.end()) {
++                        return classIt->second;
++                    }
++                    ClassInheritanceInfo *info = new ClassInheritanceInfo(STy);
++                    // Only check for primary parent class
++                    // Secondary parents are handled via offsets
++                    if (STy->elements().size() > 0) {
++	                    Type * firstElement = *(STy->elements().begin());
++	                    if (StructType *InnerSTy = dyn_cast<StructType>(firstElement)) {
++	                        ClassInheritanceInfo *parentInfo = recursiveProcessType(InnerSTy);
++	                        // Potential parent isn't really a parent ignore it
++	                        if (!parentInfo)
++	                            return info;
++	
++	                        info->parent = parentInfo;
++	                        
++	                        // Insert hashes
++	                        info->parentHashes.push_back(parentInfo->classHash);
++	                        for (uint64_t hash : parentInfo->parentHashes) {
++	                            info->parentHashes.push_back(hash);
++	                        }
++	                        
++	                        // No other members means that it is phantom class
++	                        if (STy->elements().size() == 1) {
++	                            parentInfo->phantomChildren.push_back(info);
++	                            parentInfo->fakeParentHashes.push_back(info->classHash);
++	                        }
++	                    }
++                    }
++                    classInfoMap.insert(std::make_pair(STy, info));
++                    return info;
++                }
++
++		virtual bool runOnModule(Module &M) {
++
++                        Module *SrcM;
++                        SrcM = &M;
++			size_t found;
++
++                        LLVMContext& Ctx = M.getContext();
++
++			string mname = M.getName();
++
++                        found=mname.find('.');
++			mname.erase(found);
++
++			DL = &SrcM->getDataLayout();
++
++			TypeSanUtil TypeUtil(*DL);
++
++			TypeUtil.VoidTy = Type::getInt64Ty(Ctx);
++			TypeUtil.Int8PtrTy = PointerType::getUnqual(Type::getInt8Ty(Ctx));
++			TypeUtil.Int32PtrTy = PointerType::getUnqual(Type::getInt32Ty(Ctx));
++			TypeUtil.Int64PtrTy = PointerType::getUnqual(Type::getInt64Ty(Ctx));
++			TypeUtil.IntptrTy = Type::getInt8PtrTy(Ctx);
++			TypeUtil.Int64Ty = Type::getInt64Ty(Ctx);
++			TypeUtil.Int32Ty = Type::getInt32Ty(Ctx);
++  
++			TypeUtil.MetadataTy = ArrayType::get(TypeUtil.Int64Ty, 2);
++			TypeUtil.MetaPageTable = ConstantInt::get(TypeUtil.Int64Ty, 0x400000000000);                       
++                        
++			std::vector<StructType*> StructTypes;
++		        std::vector<StructType*> Types =  SrcM->getIdentifiedStructTypes();
++
++			FunctionType *FTy;
++
++			VoidTy = Type::getInt64Ty(Ctx);
++			Int8PtrTy = PointerType::getUnqual(Type::getInt8Ty(Ctx));
++			Int32PtrTy = PointerType::getUnqual(Type::getInt32Ty(Ctx));
++			Int64PtrTy = PointerType::getUnqual(Type::getInt64Ty(Ctx));
++			IntptrTy = Type::getInt8PtrTy(Ctx);
++			Int64Ty = Type::getInt64Ty(Ctx);
++			Int32Ty = Type::getInt32Ty(Ctx);
++
++			TargetLibraryInfoImpl tlii;
++			this->tli = &(getAnalysisIfAvailable<TargetLibraryInfoWrapperPass>()->getTLI());
++
++			std::map<CallInst *, Type *> heapObjsFree, heapObjsNew;
++
++			for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
++				int index = 0;
++				for (Function::iterator BB = F->begin(), E = F->end(); BB != E; ++BB) {
++					BasicBlock& b = *BB;
++					for (BasicBlock::iterator i = b.begin(), ie = b.end(); i != ie; ++i) {
++						// to handle heap allocation
++						if (CallInst *call = dyn_cast<CallInst>(&*i)) {
++							bool isOverloadedNew = false;
++							string functionName = "";
++							if (call->getCalledFunction() != nullptr) {
++								functionName = call->getCalledFunction()->getName();
++							}
++							int unmangledStatus;
++							char *unmangledName = abi::__cxa_demangle(functionName.c_str(), nullptr, nullptr, &unmangledStatus);
++							if (unmangledStatus == 0) {
++								string unmangledNameStr(unmangledName);
++								if (unmangledNameStr.find("::operator new(unsigned long)") != string::npos ||
++									unmangledNameStr.find("::operator new(unsigned long, std::nothrow_t const&)") != string::npos ||
++									unmangledNameStr.find("::operator new[](unsigned long)") != string::npos || 
++									unmangledNameStr.find("::operator new[](unsigned long, std::nothrow_t const&)") != string::npos) {
++										isOverloadedNew = true;
++								}
++							}
++							if(isNewCall(call) || isOverloadedNew) {
++								if(Type *allocTy = getMallocAllocatedType(call, this->tli)) {
++									if (TypeUtil.interestingType(allocTy)) {
++										heapObjsNew.insert(std::pair<CallInst *, Type *>(call, allocTy));
++									}
++								}
++							}
++						}
++					}
++						
++					// to handle new 
++					for (std::map<CallInst *, Type *>::iterator it=heapObjsNew.begin(); it!=heapObjsNew.end(); ++it) {
++						Instruction *next = findNextInstruction(it->first);
++						IRBuilder<> Builder(next);
++
++						{
++                                                        TypeSanLogger.incTrackedHeap();
++							Value *Size;
++							unsigned long count = 0;
++                            IRBuilder<> PreAllocBuilder(it->first);
++							if(isMallocLikeFn(it->first, this->tli) || !isAllocLikeFn(it->first, this->tli) || !isAllocationFn(it->first, this->tli)) {
++								if (isMallocLikeFn(it->first, this->tli) || !isAllocationFn(it->first, this->tli)) {
++									Size = it->first->getArgOperand(0);
++								} else {
++									Size = it->first->getArgOperand(1);
++								}
++								if (ConstantInt *SizeConstant = dyn_cast<ConstantInt>(Size)) {
++									count = SizeConstant->getZExtValue() / DL->getTypeAllocSize(it->second);
++								} else {
++									count = 0;
++								}
++							} else if (isCallocLikeFn(it->first, this->tli)) {
++								Value *NElems = it->first->getArgOperand(0);
++								Value *ElemSize = it->first->getArgOperand(1);
++                                Size = Builder.CreateMul(NElems, ElemSize);
++							} else {
++								assert(0 && "Unknown allocation type");
++							}
++
++							string allocName = "heap:" + F->getName().str() + ":" + std::to_string(index++) + ":";
++							if (it->first->getCalledFunction() != nullptr) {
++								allocName += it->first->getCalledFunction()->getName();
++							}
++							TypeUtil.insertUpdateMetalloc(SrcM, Builder, (Value *)(it->first), it->second, 0, count, Size, allocName);
++						}
++					}
++				}
++			}
++
++
++			// to make class relation information
++            for (StructType *STy : Types) {
++                if (TypeUtil.interestingType(STy)) {
++				    recursiveProcessType(STy);
++                }
++            }
++            for (auto &infoEntry : classInfoMap) {
++                infoEntry.second->recursiveProcessFakeParentsBottomUp();
++            }
++            for (auto &infoEntry : classInfoMap) {
++                infoEntry.second->recursiveProcessFakeParentsTopDown();
++            }
++                        
++			Context = &M.getContext();
++				 			
++
++			////////////////////////////////////////////////////////// 
++			//Insert class's parent information using global variable 
++			/////////////////////////////////////////////////////////
++
++                        int classCount = 0;
++                        std::vector<Constant*> infoElems;
++                        for (auto &infoEntry : classInfoMap) {
++                            // No support for anonymous structs yet
++                            if (infoEntry.first->isLiteral()) {
++                                continue;
++                            }
++                            // SKip emitting parent sets for non-tracked structs (C-file)
++                            // Skip emitting ".base" tmp classes as their hash is identical to the real classes
++                            if (!infoEntry.first->getName().startswith("trackedtype.") || infoEntry.first->getName().endswith(".base")) {
++                                continue;
++                            }
++                            classCount++;
++                            infoElems.push_back(ConstantInt::get(Int64Ty, infoEntry.second->parentHashes.size() + 1));
++                            infoElems.push_back(ConstantInt::get(Int64Ty, infoEntry.second->classHash));
++                            for (uint64_t hash : infoEntry.second->parentHashes) {
++                                infoElems.push_back(ConstantInt::get(Int64Ty, hash));
++                            }
++                            if (infoEntry.second->fakeParentHashes.size() > 0) {
++                                // New entry for the same class, increase number of "classes"
++                                classCount++;
++                                infoElems.push_back(ConstantInt::get(Int64Ty, (1 << 31) | (infoEntry.second->fakeParentHashes.size() + 1)));
++                                infoElems.push_back(ConstantInt::get(Int64Ty, infoEntry.second->classHash));
++                                for (uint64_t hash : infoEntry.second->fakeParentHashes) {
++                                    infoElems.push_back(ConstantInt::get(Int64Ty, hash));
++                                }
++                            }
++                        }
++
++                        // No entries in this file, no need to call initializer
++                        if (infoElems.size() == 0) {
++                            return false;
++                        }
++
++                        ArrayType *InfoArrayType = ArrayType::get(Int64Ty, infoElems.size());
++                        Constant* infoArray = ConstantArray::get(InfoArrayType, infoElems);
++                        GlobalVariable* infoGlobal = new GlobalVariable(M, InfoArrayType, false, 
++                                                GlobalVariable::LinkageTypes::InternalLinkage,
++                                                nullptr, mname + ".cinfo");
++                        infoGlobal->setInitializer(infoArray);
++                        
++			///////////////////////////////////////////////
++			// Update meta-data using global constuctor
++			///////////////////////////////////////////////
++
++
++			FTy = FunctionType::get(Type::getVoidTy(Ctx), false);  
++			Function *F = Function::Create(FTy, GlobalValue::InternalLinkage,  
++					"__init", SrcM);
++
++			F->setUnnamedAddr(true);                                           
++			F->setLinkage(GlobalValue::InternalLinkage);
++			F->addFnAttr(Attribute::NoInline);
++
++			BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);             
++			IRBuilder<> Builder(BB);
++
++                        string initName = "__update_cinfo";
++                        
++			Constant *GCOVInit = SrcM->getOrInsertFunction(initName, VoidTy, Int64Ty, Int64PtrTy, nullptr);
++			Builder.CreateCall(GCOVInit, {ConstantInt::get(Int64Ty, classCount), Builder.CreatePointerCast(infoGlobal, Int64PtrTy)});
++			Builder.CreateRetVoid(); 
++
++			appendToGlobalCtors(M, F, 0); 
++			
++			return false;
++		}
++
++		virtual bool runOnFunction(Function &F) {
++			
++			return false;
++		}
++
++		bool runOnBasicBlock(BasicBlock &BB) {
++
++			return true;
++		}
++	};
++}
++
++//register pass
++char TypeSanTree::ID = 0;
++
++INITIALIZE_PASS_BEGIN(TypeSanTree, "TypeSanTree",
++                "TypeSanPass: fast type safety for C++ programs.",
++                false, false);
++INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
++INITIALIZE_PASS_END(TypeSanTree, "TypeSanTree",
++                "TypeSanPass: fast type safety for C++ programs.",
++                false, false)
++
++ModulePass *llvm::createTypeSanTreePass() {
++  return new TypeSanTree();
++}
++
+diff --git a/lib/Transforms/Utils/CMakeLists.txt b/lib/Transforms/Utils/CMakeLists.txt
+index 04d2ace..14ffdbd 100644
+--- a/lib/Transforms/Utils/CMakeLists.txt
++++ b/lib/Transforms/Utils/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_llvm_library(LLVMTransformUtils
+   LoopVersioning.cpp
+   LowerInvoke.cpp
+   LowerSwitch.cpp
++  TypeSanUtil.cpp
+   Mem2Reg.cpp
+   MemorySSA.cpp
+   MetaRenamer.cpp
+diff --git a/lib/Transforms/Utils/TypeSanUtil.cpp b/lib/Transforms/Utils/TypeSanUtil.cpp
+new file mode 100644
+index 0000000..571c92e
+--- /dev/null
++++ b/lib/Transforms/Utils/TypeSanUtil.cpp
+@@ -0,0 +1,496 @@
++#include "llvm/Transforms/Instrumentation.h"
++#include "llvm/IR/InstVisitor.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/MDBuilder.h"
++#include "llvm/Transforms/Utils/Local.h"
++#include "llvm/Transforms/Utils/ModuleUtils.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Type.h"
++#include "llvm/Pass.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/Transforms/Utils/BasicBlockUtils.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/Analysis/ConstantFolding.h"
++#include "llvm/Analysis/MemoryBuiltins.h"
++#include "llvm/Transforms/Utils/TypeSanUtil.h"
++
++#include <iostream>
++#include <string>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unordered_set>
++
++using namespace llvm;
++using std::string;
++
++#define PAGESHIFT 12
++//#define TRACK_ALLOCATIONS
++
++namespace llvm {
++        
++    TypeSanLoggerClass TypeSanLogger;
++    
++		static unsigned int crc32c(unsigned char *message) {
++			int i, j;
++			unsigned int byte, crc, mask;
++			static unsigned int table[256];
++
++			/* Set up the table, if necessary. */
++
++			if (table[1] == 0) {
++				for (byte = 0; byte <= 255; byte++) {
++					crc = byte;
++					for (j = 7; j >= 0; j--) {    // Do eight times.
++						mask = -(crc & 1);
++						crc = (crc >> 1) ^ (0xEDB88320 & mask);
++					}
++					table[byte] = crc;
++				}
++			}
++
++			/* Through with table setup, now calculate the CRC. */
++
++			i = 0;
++			crc = 0xFFFFFFFF;
++			while ((byte = message[i]) != 0) {
++				crc = (crc >> 8) ^ table[(crc ^ byte) & 0xFF];
++				i = i + 1;
++			}
++			return ~crc;
++		}
++
++		uint64_t crc64c(unsigned char *message) {
++			int i, j;
++			unsigned int byte;
++			uint64_t crc, mask;
++			static uint64_t table[256];
++
++			/* Set up the table, if necessary. */
++
++			if (table[1] == 0) {
++				for (byte = 0; byte <= 255; byte++) {
++					crc = byte;
++					for (j = 7; j >= 0; j--) {    // Do eight times.
++						mask = -(crc & 1);
++						crc = (crc >> 1) ^ (0xC96C5795D7870F42UL & mask);
++					}
++					table[byte] = crc;
++				}
++			}
++
++			/* Through with table setup, now calculate the CRC. */
++
++			i = 0;
++			crc = 0xFFFFFFFFFFFFFFFFUL;
++			while ((byte = message[i]) != 0) {
++				crc = (crc >> 8) ^ table[(crc ^ byte) & 0xFF];
++				i = i + 1;
++			}
++			return ~crc;
++		}
++
++		static uint64_t GetHashValue(string str)
++		{
++			unsigned char *className = new unsigned char[str.length() + 1];
++			strcpy((char *)className, str.c_str());
++
++			return crc64c(className);
++		}
++
++		static void remove_useless_str(string& str) {
++
++			string::size_type i;
++
++			string basesuffix = ".base";
++
++			while( (i =str.find("*")) != string::npos) {
++				str.erase(i, 1);
++			}
++
++			while( (i =str.find("'")) != string::npos) {
++				str.erase(i, 1);
++			}
++
++			i = str.find(basesuffix);
++
++			if (i != string::npos)
++				str.erase(i, basesuffix.length());
++		}
++	
++        class StructNode;
++        class ArrayNode;
++
++        class TypeNode {
++        public:
++            virtual StructNode* asStructNode() { return nullptr; }
++            virtual ArrayNode* asArrayNode() { return nullptr; }
++        };
++
++        class StructNode : public TypeNode {
++            static std::map<StructType *, StructNode *> structNodeCache;
++            StructNode(StructType *baseType, unsigned long size) : baseType(baseType), size(size) {
++                offsets.push_back(std::make_pair(0, this));
++            }
++        public:
++            std::list<std::pair<unsigned long, TypeNode*> > offsets;
++            StructType *baseType;
++            unsigned long size;
++            
++            static StructNode* getFromCache(StructType *type) {
++                auto iterator = structNodeCache.find(type);
++                if (iterator != structNodeCache.end()) {
++                    return iterator->second;
++                } else {
++                    return nullptr;
++                }
++            }
++            static StructNode* create(StructType *baseType, unsigned long size) {
++                if (StructNode *existing = StructNode::getFromCache(baseType)) {
++                    return existing;
++                } else {
++                    StructNode *result = new StructNode(baseType, size);
++                    structNodeCache.insert(std::make_pair(baseType, result));
++                    return result;
++                }
++            }
++            StructNode* asStructNode() override { return this; }
++        };
++        std::map<StructType *, StructNode *> StructNode::structNodeCache;
++
++        class ArrayNode : public TypeNode {
++            static std::map<std::pair<StructNode *, unsigned long>, ArrayNode *> arrayNodeCache;
++            ArrayNode(unsigned long count, StructNode *element) : count(count), element(element) {}
++        public:
++            unsigned long count;
++            StructNode *element;
++            
++            static ArrayNode* create(unsigned long count, TypeNode *element) {
++                unsigned long thisCount;
++                StructNode *thisElement;
++                if (ArrayNode *nestedArray = element->asArrayNode()) {
++                    thisCount = count * nestedArray->count;
++                    thisElement = nestedArray->element;
++                } else if (StructNode *nestedStruct = element->asStructNode()) {
++                    thisCount = count;
++                    thisElement = nestedStruct;
++                } else {
++                    assert(0 && "Unsupported element type in ArrayNode constructor");
++                }
++                auto iterator = arrayNodeCache.find(std::make_pair(thisElement, thisCount));
++                if (iterator != arrayNodeCache.end()) {
++                    return iterator->second;
++                } else {
++                    ArrayNode *result = new ArrayNode(thisCount, thisElement);
++                    arrayNodeCache.insert(std::make_pair(std::make_pair(thisElement, thisCount), result));
++                    return result; 
++                }
++            }
++            ArrayNode* asArrayNode() override { return this; }
++        };
++        std::map<std::pair<StructNode *, unsigned long>, ArrayNode *> ArrayNode::arrayNodeCache;
++        
++        static bool isInterestingStructType(StructType *STy) {
++            if(!STy->isOpaque()) {
++                    return true;
++            }
++            return false;
++        }
++        
++        static bool isInterestingArrayType(ArrayType *ATy) {
++            Type *InnerTy = ATy->getElementType();
++            StructType *InnerSTy = dyn_cast<StructType>(InnerTy);
++            if (InnerSTy) {
++                return isInterestingStructType(InnerSTy);
++            }
++            ArrayType *InnerATy = dyn_cast<ArrayType>(InnerTy);
++            if (InnerATy) {
++                return isInterestingArrayType(InnerATy);
++            }
++            return false;
++        }
++        
++        static TypeNode* getStructLayout(const DataLayout &DL, Type *rootType, std::list<std::pair<unsigned long, TypeNode*> > *nestedOffsets);
++        
++        static void mergeStructLayout(const DataLayout &DL, Type *innerType, std::list<std::pair<unsigned long, TypeNode*> > *offsets, unsigned long baseOffset) {
++            std::list<std::pair<unsigned long, TypeNode*> > nestedOffsets;
++            getStructLayout(DL, innerType, &nestedOffsets);
++            for (auto &entry : nestedOffsets) {
++                // Don't add type-hash for offset 0 (use root type-hash instead)
++                if (baseOffset + entry.first != 0) {
++                   offsets->push_back(std::make_pair(baseOffset + entry.first, entry.second));
++                }
++            }
++            return;
++        }
++        
++        static TypeNode* getStructLayout(const DataLayout &DL, Type *rootType, std::list<std::pair<unsigned long, TypeNode*> > *nestedOffsets = nullptr) {
++            StructType *STy = dyn_cast<StructType>(rootType);
++            if(STy && isInterestingStructType(STy)) {
++                StructNode *structNode = StructNode::getFromCache(STy);
++                if (!structNode) {
++                    const StructLayout *SL = DL.getStructLayout(STy);
++                    structNode = StructNode::create(STy, DL.getTypeAllocSize(STy));
++                    
++                    // Traverse all components of struct type
++                    unsigned long pos = 0;
++                    for (Type *InnerTy : STy->elements()) {
++                        StructType *InnerSTy = dyn_cast<StructType>(InnerTy);
++                        // Inline all interesting inner structs
++                        if (InnerSTy) {
++                            if(!isInterestingStructType(InnerSTy)) { continue; }
++                            mergeStructLayout(DL, InnerSTy, &(structNode->offsets), SL->getElementOffset(pos));
++                        }
++                        ArrayType *InnerATy = dyn_cast<ArrayType>(InnerTy);
++                        // Inline all intersting inner arrays and create corresponding array nodes
++                        if (InnerATy) {
++                            ArrayNode *nestedArray = nullptr;
++                            if (TypeNode *nestedNode = getStructLayout(DL, InnerATy, nullptr)) {
++                                nestedArray = nestedNode->asArrayNode();
++                            }
++                            if (nestedArray) {
++                                // Array at offset 0 / Add first element manually as struct
++                                if (SL->getElementOffset(pos) == 0) {
++                                    mergeStructLayout(DL, nestedArray->element->baseType, &(structNode->offsets), SL->getElementOffset(pos));
++                                    // Add remaining elements of array (as partial node)
++                                    if (nestedArray->count > 1) {
++                                        ArrayNode *partalNestedArray = ArrayNode::create(nestedArray->count - 1, nestedArray->element);
++                                        structNode->offsets.push_back(std::make_pair(partalNestedArray->element->size, partalNestedArray));
++                                    }
++                                // Array of count 1 / Flatten it into struct
++                                } else if (nestedArray->count == 1) {
++                                    mergeStructLayout(DL, nestedArray->element->baseType, &(structNode->offsets), SL->getElementOffset(pos));
++                                // Add array node in default case
++                                } else {
++                                    structNode->offsets.push_back(std::make_pair(SL->getElementOffset(pos), nestedArray));
++                                }
++                            }
++                        }
++                        pos++;
++                    }
++                }
++                
++                // Merge offsets into parent struct node if requested
++                if (nestedOffsets != nullptr) {
++                    nestedOffsets->insert(nestedOffsets->end(), structNode->offsets.begin(), structNode->offsets.end());
++                    return nullptr;
++                // Return struct node
++                } else {
++                    return structNode;
++                }
++            }
++            ArrayType *ATy = dyn_cast<ArrayType>(rootType);
++            if (ATy) {
++                Type *InnerTy = ATy->getElementType();
++                // Nested struct creates new array node if interesting
++                StructType *InnerSTy = dyn_cast<StructType>(InnerTy);
++                if (InnerSTy) {
++                    if(!isInterestingStructType(InnerSTy)) { return nullptr; }
++                    return ArrayNode::create(ATy->getNumElements(), getStructLayout(DL, InnerSTy, nullptr));
++                }
++                // Nested arrays just multiply count field and continue recursively
++                ArrayType *InnerATy = dyn_cast<ArrayType>(InnerTy);
++                if (InnerATy) {
++                    ArrayNode *nestedArray = nullptr;
++                    if (TypeNode *nestedNode = getStructLayout(DL, InnerATy, nullptr)) {
++                        nestedArray = nestedNode->asArrayNode();
++                    }
++                    if (nestedArray) {
++                        return ArrayNode::create(ATy->getNumElements(), nestedArray);
++                    }
++                }
++            }
++            return nullptr;
++        }
++                
++        uint64_t TypeSanUtil::getHashCodeFromStruct(StructType *type) {
++            string str;
++            if (!type->isLiteral())
++                str = type->getName();
++            else
++                str = "trackedtype._";
++            remove_useless_str(str);
++            uint64_t hash = GetHashValue(str);
++            TypeSanLogger.addHash(hash, str);
++            return hash;
++        }
++        
++        static GlobalVariable *getOrPopulateTypeInfo(Module *SrcM, Type *Int64Ty, StructNode *structNode, string &name) {
++            if (structNode->baseType->isLiteral()) {
++                name = "trackedtype._";
++            } else if (structNode->baseType->getName().startswith("trackedtype.")) {
++                name = structNode->baseType->getName();
++            } else if (structNode->baseType->getName().startswith("blacklistedtype.")) {
++                name = structNode->baseType->getName();
++            } else {
++                name = "noncxxfakesentinel";
++            }
++            string typeInfoName = "_____typeinfo_____" + name;
++            GlobalVariable *typeInfo = SrcM->getNamedGlobal(typeInfoName);
++            if (typeInfo)
++                return typeInfo;
++            std::vector<Constant *> infoMembers;
++            infoMembers.push_back(ConstantInt::get(Int64Ty, structNode->size));
++            if (!structNode->baseType->isLiteral() && structNode->baseType->getName().startswith("trackedtype.")) {
++                unsigned long endOfLastArray = 0;
++                for (auto &entry : structNode->offsets) {
++                    // Insert a sentinel to signal the end of the last array unless the current element matches the offset
++                    if (endOfLastArray != 0 && entry.first != endOfLastArray) {
++                        infoMembers.push_back(ConstantInt::get(Int64Ty, endOfLastArray));
++                        infoMembers.push_back(ConstantInt::get(Int64Ty, -1));
++                        endOfLastArray = 0;
++                    }
++                    if (StructNode *nestedStruct = entry.second->asStructNode()) {
++                        infoMembers.push_back(ConstantInt::get(Int64Ty, entry.first));
++                        infoMembers.push_back(ConstantInt::get(Int64Ty, TypeSanUtil::getHashCodeFromStruct(nestedStruct->baseType)));
++                    } else {
++			string tmpname;
++                        ArrayNode *nestedArray = entry.second->asArrayNode();
++                        assert(nestedArray && "StructNode member can only be Leaf or Array");
++                        infoMembers.push_back(ConstantInt::get(Int64Ty, ((unsigned long)1 << 63) | entry.first));
++                        infoMembers.push_back(ConstantExpr::getPtrToInt(getOrPopulateTypeInfo(SrcM, Int64Ty, nestedArray->element, tmpname), Int64Ty));
++                        endOfLastArray = entry.first + nestedArray->element->size * nestedArray->count;
++                    }
++                }
++            } else if (structNode->baseType->isLiteral() || !structNode->baseType->getName().startswith("blacklistedtype.")) {
++                infoMembers.push_back(ConstantInt::get(Int64Ty, 0));
++                infoMembers.push_back(ConstantInt::get(Int64Ty, -1));
++            }
++            infoMembers.push_back(ConstantInt::get(Int64Ty, -1));
++            ArrayType *TypeInfoTy = ArrayType::get(Int64Ty, infoMembers.size());
++            typeInfo = new GlobalVariable(*SrcM, TypeInfoTy, false, 
++                                            GlobalVariable::LinkageTypes::InternalLinkage,
++                                            nullptr, typeInfoName);
++            Constant *initializer = ConstantArray::get(TypeInfoTy, infoMembers);
++            typeInfo->setInitializer(initializer);
++            // Compute hash-code for current node for Logger
++            TypeSanUtil::getHashCodeFromStruct(structNode->baseType);
++            return typeInfo;
++        }
++        
++	bool TypeSanUtil::interestingType(Type *rootType) {
++
++		StructType *STy = dyn_cast<StructType>(rootType);
++		if(STy) {
++                    return isInterestingStructType(STy);
++		}
++		ArrayType *ATy = dyn_cast<ArrayType>(rootType);
++                if (ATy) {
++                    return isInterestingArrayType(ATy);
++                }
++		return false;
++	}
++
++	
++	void TypeSanUtil::insertUpdateMetalloc(Module *SrcM, IRBuilder<> &Builder, Value *ptrValue, Type *allocationType, int alignment, unsigned long count, Value *size, string allocName) {
++                Value *ptrToInt = Builder.CreatePtrToInt(ptrValue, Int64Ty);
++
++                TypeNode *typeNode = getStructLayout(DL, allocationType, nullptr);
++                StructNode *structNode = nullptr;
++                if (count != 0) {
++                    ArrayNode *tmpArrayNode = ArrayNode::create(count, typeNode);
++                    structNode = tmpArrayNode->element;
++                    count = tmpArrayNode->count;
++                } else {
++                    structNode = typeNode->asStructNode();
++                    if (structNode == nullptr) {
++                        structNode = typeNode->asArrayNode()->element;
++                    }
++                }
++		string typeName;
++                GlobalVariable *typeInfo = getOrPopulateTypeInfo(SrcM, Int64Ty, structNode, typeName);
++                Value *ptrToStore;
++                // No support for anonymous structs yet
++                if (structNode->baseType->isLiteral()) {
++                    ptrToStore = ConstantInt::get(Int64Ty, 0);
++                } else {
++                    ptrToStore = ptrToInt;
++                }
++                
++		Value *pageIdx = Builder.CreateLShr(ptrToInt, ConstantInt::get(Int64Ty, PAGESHIFT));
++		Value *pageTableBase = Builder.CreateIntToPtr(MetaPageTable, Int64PtrTy);
++		Value *pageTablePtr = Builder.CreateGEP(pageTableBase, pageIdx);
++		Value *pageTableEntry = Builder.CreateLoad(pageTablePtr);
++		Value *metadataBaseInt = Builder.CreateLShr(pageTableEntry, ConstantInt::get(Int64Ty, 8));
++		Value *alignmentValue = (alignment != 0) ? ConstantInt::get(Int64Ty, alignment) : Builder.CreateAnd(pageTableEntry, ConstantInt::get(Int64Ty, 0xFF));
++		Value *alignmentOffset = (alignment != 0) ? ConstantInt::get(Int64Ty, (1 << alignment) - 1) : Builder.CreateSub(Builder.CreateShl(
++			ConstantInt::get(Int64Ty, 1), alignmentValue), ConstantInt::get(Int64Ty, 1));
++		Value *metadataBase = Builder.CreateIntToPtr(metadataBaseInt, Int64PtrTy);
++		Value *pageOffset = Builder.CreateAnd(ptrToInt, ConstantInt::get(Int64Ty, (1 << PAGESHIFT) - 1));
++		Value *metadataOffset = Builder.CreateShl(Builder.CreateLShr(pageOffset, alignmentValue), 1);
++		Value *metadataPtr = Builder.CreateGEP(metadataBase, metadataOffset);
++		// Inline stores if size and alignment are known constants (stack/globals)
++		bool didInline = false;
++		if (count != 0 && alignment != 0) {
++			long constantSize = ((structNode->size * count) + ((1 << alignment) - 1)) >> alignment;
++			if (constantSize <= 16) {
++				didInline = true;
++                                Value *typeInfoPtrInt = nullptr;
++                                if (count == 1) {
++                                     typeInfoPtrInt = ConstantExpr::getAdd(ConstantExpr::getPtrToInt(typeInfo, Int64Ty), ConstantInt::get(Int64Ty, 8));
++                                } else {
++                                    typeInfoPtrInt = ConstantExpr::getPtrToInt(typeInfo, Int64Ty);
++                                }
++                                Builder.CreateStore(ptrToStore, metadataPtr);
++                                Value *metadataPtr2 = Builder.CreateGEP(metadataPtr, ConstantInt::get(Int64Ty, 1));
++                                Builder.CreateStore(typeInfoPtrInt, metadataPtr2);
++                                unsigned long offset = alignment;
++				for (int i = 1; i < constantSize; ++i) {
++					Value *metadataPtrWithIndex = Builder.CreateGEP(metadataPtr, ConstantInt::get(Int64Ty, 2 * i));
++                                        Builder.CreateStore(ptrToStore, metadataPtrWithIndex);
++					Value *metadataPtrWithIndex2 = Builder.CreateGEP(metadataPtr, ConstantInt::get(Int64Ty, 2 * i + 1));
++                                        Builder.CreateStore(typeInfoPtrInt, metadataPtrWithIndex2);
++                                        offset += alignment;
++                                }
++			}
++                }
++		// Call out to helper if no inlining occured
++		if (!didInline) {
++                        Value *metadataSize;
++                        Value *typeInfoPtrInt = nullptr;
++			if (count == 0) {
++				metadataSize = Builder.CreateLShr(Builder.CreateAdd(size, alignmentOffset), alignmentValue);
++                                typeInfoPtrInt = ConstantExpr::getPtrToInt(typeInfo, Int64Ty);
++			} else {
++				metadataSize = Builder.CreateLShr(Builder.CreateAnd(Builder.CreateAdd(ConstantInt::get(Int64Ty, structNode->size * count), alignmentOffset),
++                                                                            ConstantInt::get(Int64Ty, ((unsigned long)1 << 63) - 1)),
++                                                        alignmentValue);
++                                if (count == 1) {
++                                    typeInfoPtrInt = ConstantExpr::getAdd(ConstantExpr::getPtrToInt(typeInfo, Int64Ty), ConstantInt::get(Int64Ty, 8));
++                                } else {
++                                    typeInfoPtrInt = ConstantExpr::getPtrToInt(typeInfo, Int64Ty);
++                                }
++			}
++			Function *MetallocMemset = (Function*)SrcM->getOrInsertFunction("metalloc_widememset", VoidTy, Int64PtrTy, Int64Ty, Int64Ty, Int64Ty, nullptr);
++			Value *Param[4] = {metadataPtr, metadataSize, ptrToStore, typeInfoPtrInt};
++			Builder.CreateCall(MetallocMemset, Param);
++                }
++
++#ifdef TRACK_ALLOCATIONS
++		static GlobalVariable* gvar_int64_typecasts;
++		if (!gvar_int64_typecasts) {
++			gvar_int64_typecasts = new GlobalVariable(/*Module=*/*SrcM,
++			/*Type=*/IntegerType::get(SrcM->getContext(), 64),
++			/*isConstant=*/false,
++			/*Linkage=*/GlobalValue::ExternalLinkage,
++			/*Initializer=*/0,
++			/*Name=*/"__typesan_alloc_count");
++			gvar_int64_typecasts->setAlignment(8);
++		}
++                LoadInst* typecasts = Builder.CreateLoad(gvar_int64_typecasts);
++                ConstantInt* one = ConstantInt::get(SrcM->getContext(), APInt(64, StringRef("1"), 10));
++                Value* typecasts_inc = Builder.CreateAdd(typecasts, one);
++                Builder.CreateStore(typecasts_inc, gvar_int64_typecasts);
++#endif
++	}
++
++}
++
+diff --git a/tools/opt/opt.cpp b/tools/opt/opt.cpp
+index e374e1f..e8197af 100644
+--- a/tools/opt/opt.cpp
++++ b/tools/opt/opt.cpp
+@@ -336,6 +336,7 @@ int main(int argc, char **argv) {
+   initializeWinEHPreparePass(Registry);
+   initializeDwarfEHPreparePass(Registry);
+   initializeSafeStackPass(Registry);
++  initializeMetaStackPass(Registry);
+   initializeSjLjEHPreparePass(Registry);
+ 
+ #ifdef LINK_POLLY_INTO_TOOLS
+diff --git a/version b/version
+new file mode 100644
+index 0000000..f88a703
+--- /dev/null
++++ b/version
+@@ -0,0 +1,14 @@
++llvm :  
++commit 8f4f26c9c7fec12eb039be6b20313a51417c97bb
++Author: Sanjay Patel <spatel@rotateright.com>
++Date:   Sat Mar 12 21:09:26 2016 +0000
++
++clang:
++commit d59a142ef50bf041797143db71d2d4777fd32d27
++Author: Nico Weber <nicolasweber@gmx.de>
++Date:   Sat Mar 12 19:55:59 2016 +0000
++
++compiler-rt:
++commit 961e78720a32929d7e4fc13a72d7266d59672c42
++Author: Nico Weber <nicolasweber@gmx.de>
++Date:   Sat Mar 12 01:57:31 2016 +0000

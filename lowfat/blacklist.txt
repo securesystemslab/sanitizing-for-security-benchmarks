@@ -1,0 +1,40 @@
+# perlbench
+fun:S_regbranch
+fun:S_nextchar
+fun:S_regatom
+fun:S_regmatch
+
+# gcc
+fun:init_alias_analysis
+fun:cse_basic_block
+fun:cse_insn
+fun:insert_regs
+fun:insert
+fun:canon_reg
+fun:delete_reg_equiv
+fun:cse_process_notes
+fun:fold_rtx
+fun:canon_rtx
+fun:cse_rtx_varies_p
+fun:equiv_constant
+fun:record_jump_cond
+fun:reload
+fun:set_label_offsets
+fun:set_offsets_for_label
+fun:end_alias_analysis
+fun:invalidate
+fun:invalidate_for_call
+fun:merge_equiv_classes
+fun:mark_constant_function
+
+# h264ref
+fun:init_contexts
+
+# namd
+fun:_ZN11ObjectArenaIcE11getNewArrayEi
+
+# soplex
+fun:_ZN6soplex5SVSet5reMaxEi
+fun:_ZN6soplex5SVSet8memRemaxEi
+fun:_ZN6soplex5SVSet6createEi
+fun:_ZN6soplex5SVSet5xtendERNS_7SVectorEi

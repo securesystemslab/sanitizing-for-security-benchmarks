@@ -1,0 +1,858 @@
+diff --git a/lib/CMakeLists.txt b/lib/CMakeLists.txt
+index 718b128..918d9a3 100644
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -48,4 +48,9 @@ if(COMPILER_RT_BUILD_SANITIZERS)
+   if(COMPILER_RT_HAS_CFI)
+     add_subdirectory(cfi)
+   endif()
++
++  add_subdirectory(typesan)
++
++  add_subdirectory(metalloc)
++
+ endif()
+diff --git a/lib/metalloc/CMakeLists.txt b/lib/metalloc/CMakeLists.txt
+new file mode 100644
+index 0000000..fd392c2
+--- /dev/null
++++ b/lib/metalloc/CMakeLists.txt
+@@ -0,0 +1,24 @@
++set(METALLOC_SOURCES
++  metastack.cc
++  metaglobal.cc
++  metautils.cc
++  )
++
++include_directories(..)
++
++set(METALLOC_CFLAGS ${SANITIZER_COMMON_CFLAGS})
++
++add_custom_target(metalloc)
++
++add_compiler_rt_runtime(clang_rt.metalloc
++        STATIC 
++        ARCHS x86_64 
++        SOURCES ${METALLOC_SOURCES}
++              $<TARGET_OBJECTS:RTInterception.x86_64>
++        CFLAGS ${METALLOC_CFLAGS}
++ 
++        PARENT_TARGET metalloc)
++
++add_sanitizer_rt_symbols(clang_rt.metalloc)
++
++add_dependencies(compiler-rt metalloc)
+diff --git a/lib/metalloc/metaglobal.cc b/lib/metalloc/metaglobal.cc
+new file mode 100644
+index 0000000..61e5c66
+--- /dev/null
++++ b/lib/metalloc/metaglobal.cc
+@@ -0,0 +1,71 @@
++#include <sys/mman.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <link.h>
++#include <metapagetable_core.h>
++
++#include "sanitizer_common/sanitizer_common.h"
++
++extern char __executable_start;
++extern char _etext;
++extern char __data_start;
++extern char _edata;
++extern char __bss_start;
++extern char _end;
++
++const int kMetaPageSize = 4096;
++const unsigned kMetaGlobalAlignBits = 3;
++
++static int shared_object_callback(struct dl_phdr_info *info, size_t size, void *data) {
++    for (int i = 0; i < info->dlpi_phnum; i++) {
++        if (info->dlpi_phdr[i].p_type != PT_LOAD) {
++            continue;
++        }
++        unsigned long base_addr = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
++        unsigned long section_size = info->dlpi_phdr[i].p_memsz;
++        if (section_size == 0) {
++            continue;
++        }
++        if (pageTable[(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr) >> METALLOC_PAGESHIFT] != 0) {
++            return 0;
++        }
++        unsigned long page_align_offset = kMetaPageSize - 1;
++        unsigned long page_align_mask = ~((unsigned long)kMetaPageSize - 1);
++        unsigned long aligned_start = base_addr & page_align_mask;
++        unsigned long aligned_size = ((section_size + base_addr - aligned_start) + page_align_offset) & page_align_mask;
++        void *exec_metadata = allocate_metadata(aligned_size, kMetaGlobalAlignBits);
++        set_metapagetable_entries((void*)aligned_start, aligned_size, exec_metadata, kMetaGlobalAlignBits);
++    }
++    return 0;
++}
++
++extern "C" SANITIZER_INTERFACE_ATTRIBUTE
++void metalloc_init_globals(unsigned int object) {
++    // Check if this shared object has already been loaded or not
++    // Enough to check single object for mapping
++    if (pageTable[object >> METALLOC_PAGESHIFT] != 0) {
++        return;
++    }
++    dl_iterate_phdr(&shared_object_callback, NULL);
++
++    return;
++}
++
++extern "C" __attribute__((visibility("default")))
++#if !SANITIZER_CAN_USE_PREINIT_ARRAY
++// On ELF platforms, the constructor is invoked using .preinit_array (see below)
++__attribute__((constructor(0)))
++#endif
++void __metaglobal_init() {
++    metalloc_init_globals((unsigned long)&__executable_start);
++}
++               
++#if SANITIZER_CAN_USE_PREINIT_ARRAY
++// On ELF platforms, run safestack initialization before any other constructors.
++// On other platforms we use the constructor attribute to arrange to run our
++// initialization early.
++extern "C" {
++__attribute__((section(".preinit_array"),
++               used)) void (*__metaglobal_preinit)(void) = __metaglobal_init;
++}
++#endif
+diff --git a/lib/metalloc/metapagetable_core.h b/lib/metalloc/metapagetable_core.h
+new file mode 100644
+index 0000000..d21c8a0
+--- /dev/null
++++ b/lib/metalloc/metapagetable_core.h
+@@ -0,0 +1,29 @@
++#ifndef METAPAGETABLE_CORE_H
++#define METAPAGETABLE_CORE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define METALLOC_PAGESHIFT 12
++#define METALLOC_PAGESIZE (1 << METALLOC_PAGESHIFT)
++
++#define METALLOC_FIXEDSHIFT 3
++#define METALLOC_FIXEDSIZE (1 << METALLOC_FIXEDSHIFT)
++
++//extern unsigned long pageTable[];
++#define pageTable ((unsigned long*)(0x400000000000))
++extern int is_fixed_compression();
++extern void page_table_init();
++extern void* allocate_metadata(unsigned long size, unsigned long alignment);
++extern void deallocate_metadata(void *ptr, unsigned long size, unsigned long alignment);
++extern void set_metapagetable_entries(void *ptr, unsigned long size, void *metaptr, int alignment);
++extern unsigned long get_metapagetable_entry(void *ptr);
++extern void allocate_metapagetable_entries(void *ptr, unsigned long size);
++extern void deallocate_metapagetable_entries(void *ptr, unsigned long size);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* !METAPAGETABLE_CORE_H */
+diff --git a/lib/metalloc/metastack.cc b/lib/metalloc/metastack.cc
+new file mode 100644
+index 0000000..1739f33
+--- /dev/null
++++ b/lib/metalloc/metastack.cc
+@@ -0,0 +1,268 @@
++//===-- metastack.cc ------------------------------------------------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the runtime support for the safe stack protection
++// mechanism. The runtime manages allocation/deallocation of the unsafe stack
++// for the main thread, as well as all pthreads that are created/destroyed
++// during program execution.
++//
++//===----------------------------------------------------------------------===//
++
++#include <limits.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <sys/resource.h>
++#include <sys/types.h>
++#include <sys/user.h>
++
++#include "interception/interception.h"
++#include "sanitizer_common/sanitizer_common.h"
++
++#include "metapagetable_core.h"
++
++// TODO: The runtime library does not currently protect the safe stack beyond
++// relying on the system-enforced ASLR. The protection of the (safe) stack can
++// be provided by three alternative features:
++//
++// 1) Protection via hardware segmentation on x86-32 and some x86-64
++// architectures: the (safe) stack segment (implicitly accessed via the %ss
++// segment register) can be separated from the data segment (implicitly
++// accessed via the %ds segment register). Dereferencing a pointer to the safe
++// segment would result in a segmentation fault.
++//
++// 2) Protection via software fault isolation: memory writes that are not meant
++// to access the safe stack can be prevented from doing so through runtime
++// instrumentation. One way to do it is to allocate the safe stack(s) in the
++// upper half of the userspace and bitmask the corresponding upper bit of the
++// memory addresses of memory writes that are not meant to access the safe
++// stack.
++//
++// 3) Protection via information hiding on 64 bit architectures: the location
++// of the safe stack(s) can be randomized through secure mechanisms, and the
++// leakage of the stack pointer can be prevented. Currently, libc can leak the
++// stack pointer in several ways (e.g. in longjmp, signal handling, user-level
++// context switching related functions, etc.). These can be fixed in libc and
++// in other low-level libraries, by either eliminating the escaping/dumping of
++// the stack pointer (i.e., %rsp) when that's possible, or by using
++// encryption/PTR_MANGLE (XOR-ing the dumped stack pointer with another secret
++// we control and protect better, as is already done for setjmp in glibc.)
++// Furthermore, a static machine code level verifier can be ran after code
++// generation to make sure that the stack pointer is never written to memory,
++// or if it is, its written on the safe stack.
++//
++// Finally, while the Unsafe Stack pointer is currently stored in a thread
++// local variable, with libc support it could be stored in the TCB (thread
++// control block) as well, eliminating another level of indirection and making
++// such accesses faster. Alternatively, dedicating a separate register for
++// storing it would also be possible.
++
++/// Minimum stack alignment for the unsafe stack.
++const unsigned kMetaStackAlignBits = 6;
++const unsigned kMetaStackAlign = 1 << kMetaStackAlignBits;
++
++/// Default size of the unsafe stack. This value is only used if the stack
++/// size rlimit is set to infinity.
++const unsigned kDefaultTrackedStackSize = 0x2800000;
++
++/// Runtime page size obtained through sysconf
++static unsigned pageSize;
++
++// TODO: To make accessing the unsafe stack pointer faster, we plan to
++// eventually store it directly in the thread control block data structure on
++// platforms where this structure is pointed to by %fs or %gs. This is exactly
++// the same mechanism as currently being used by the traditional stack
++// protector pass to store the stack guard (see getStackCookieLocation()
++// function above). Doing so requires changing the tcbhead_t struct in glibc
++// on Linux and tcb struct in libc on FreeBSD.
++//
++// For now, store it in a thread-local variable.
++extern "C" {
++__attribute__((visibility(
++    "default"))) __thread void *__metastack_tracked_stack_ptr = nullptr;
++}
++
++// Per-thread unsafe stack information. It's not frequently accessed, so there
++// it can be kept out of the tcb in normal thread-local variables.
++static __thread void *unsafe_stack_start = nullptr;
++static __thread size_t unsafe_stack_size = 0;
++static __thread size_t unsafe_stack_guard = 0;
++
++static inline void unsafe_stack_alloc_meta(void *addr, unsigned long size) {
++    unsigned long alignment = kMetaStackAlignBits;
++    void *metadata = allocate_metadata(size, alignment);
++    set_metapagetable_entries(addr, size, metadata, alignment);
++}
++
++static inline void unsafe_stack_free_meta(void *unsafe_stack_start, unsigned long unsafe_stack_size) {
++    unsigned long alignment = kMetaStackAlignBits;
++    deallocate_metadata(unsafe_stack_start, unsafe_stack_size, alignment);
++}
++
++static inline void *unsafe_stack_alloc(size_t size, size_t guard) {
++  CHECK_GE(size + guard, size);
++  void *addr = MmapOrDie(size + guard, "tracked_stack_alloc");
++  MprotectNoAccess((uptr)addr, (uptr)guard);
++  unsafe_stack_alloc_meta((char *)addr + guard, size);
++  
++  return (char *)addr + guard;
++}
++
++static inline void unsafe_stack_setup(void *start, size_t size, size_t guard) {
++  CHECK_GE((char *)start + size, (char *)start);
++  CHECK_GE((char *)start + guard, (char *)start);
++  void *stack_ptr = (char *)start + size;
++  CHECK_EQ((((size_t)stack_ptr) & (kMetaStackAlign - 1)), 0);
++  
++  __metastack_tracked_stack_ptr = stack_ptr;
++  unsafe_stack_start = start;
++  unsafe_stack_size = size;
++  unsafe_stack_guard = guard;
++}
++
++static void unsafe_stack_free() {
++  if (unsafe_stack_start) {
++    UnmapOrDie((char *)unsafe_stack_start - unsafe_stack_guard,
++               unsafe_stack_size + unsafe_stack_guard);
++    unsafe_stack_free_meta(unsafe_stack_start, unsafe_stack_size);
++  }
++  unsafe_stack_start = nullptr;
++}
++
++/// Thread data for the cleanup handler
++static pthread_key_t thread_cleanup_key;
++
++/// Safe stack per-thread information passed to the thread_start function
++struct tinfo {
++  void *(*start_routine)(void *);
++  void *start_routine_arg;
++
++  void *unsafe_stack_start;
++  size_t unsafe_stack_size;
++  size_t unsafe_stack_guard;
++};
++
++/// Wrap the thread function in order to deallocate the unsafe stack when the
++/// thread terminates by returning from its main function.
++static void *thread_start(void *arg) {
++  struct tinfo *tinfo = (struct tinfo *)arg;
++
++  void *(*start_routine)(void *) = tinfo->start_routine;
++  void *start_routine_arg = tinfo->start_routine_arg;
++
++  // Setup the unsafe stack; this will destroy tinfo content
++  unsafe_stack_setup(tinfo->unsafe_stack_start, tinfo->unsafe_stack_size,
++                     tinfo->unsafe_stack_guard);
++
++  // Make sure out thread-specific destructor will be called
++  // FIXME: we can do this only any other specific key is set by
++  // intercepting the pthread_setspecific function itself
++  pthread_setspecific(thread_cleanup_key, (void *)1);
++
++  return start_routine(start_routine_arg);
++}
++
++/// Thread-specific data destructor
++static void thread_cleanup_handler(void *_iter) {
++  // We want to free the unsafe stack only after all other destructors
++  // have already run. We force this function to be called multiple times.
++  // User destructors that might run more then PTHREAD_DESTRUCTOR_ITERATIONS-1
++  // times might still end up executing after the unsafe stack is deallocated.
++  size_t iter = (size_t)_iter;
++  if (iter < PTHREAD_DESTRUCTOR_ITERATIONS) {
++    pthread_setspecific(thread_cleanup_key, (void *)(iter + 1));
++  } else {
++    // This is the last iteration
++    unsafe_stack_free();
++  }
++}
++
++/// Intercept thread creation operation to allocate and setup the unsafe stack
++INTERCEPTOR(int, pthread_create, pthread_t *thread,
++            const pthread_attr_t *attr,
++            void *(*start_routine)(void*), void *arg) {
++
++  size_t size = 0;
++  size_t guard = 0;
++
++  if (attr) {
++    pthread_attr_getstacksize(attr, &size);
++    pthread_attr_getguardsize(attr, &guard);
++  } else {
++    // get pthread default stack size
++    pthread_attr_t tmpattr;
++    pthread_attr_init(&tmpattr);
++    pthread_attr_getstacksize(&tmpattr, &size);
++    pthread_attr_getguardsize(&tmpattr, &guard);
++    pthread_attr_destroy(&tmpattr);
++  }
++  
++  CHECK_NE(size, 0);
++  CHECK_EQ((size & (kMetaStackAlign - 1)), 0);
++  CHECK_EQ((guard & (pageSize - 1)), 0);
++
++  void *addr = unsafe_stack_alloc(size, guard);
++  struct tinfo *tinfo =
++      (struct tinfo *)(((char *)addr) + size - sizeof(struct tinfo));
++  tinfo->start_routine = start_routine;
++  tinfo->start_routine_arg = arg;
++  tinfo->unsafe_stack_start = addr;
++  tinfo->unsafe_stack_size = size;
++  tinfo->unsafe_stack_guard = guard;
++
++  return REAL(pthread_create)(thread, attr, thread_start, tinfo);
++}
++
++extern "C" __attribute__((visibility("default")))
++#if !SANITIZER_CAN_USE_PREINIT_ARRAY
++// On ELF platforms, the constructor is invoked using .preinit_array (see below)
++__attribute__((constructor(0)))
++#endif
++void __metastack_init() {
++  // Determine the stack size for the main thread.
++  size_t size = kDefaultTrackedStackSize;
++  size_t guard = 4096;
++
++  struct rlimit limit;
++  if (getrlimit(RLIMIT_STACK, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY)
++    size = limit.rlim_cur;
++  
++  // Allocate unsafe stack for main thread
++  void *addr = unsafe_stack_alloc(size, guard);
++
++  unsafe_stack_setup(addr, size, guard);
++  pageSize = sysconf(_SC_PAGESIZE);
++
++  // Initialize pthread interceptors for thread allocation
++  INTERCEPT_FUNCTION(pthread_create);
++
++  // Setup the cleanup handler
++  pthread_key_create(&thread_cleanup_key, thread_cleanup_handler);
++}
++
++#if SANITIZER_CAN_USE_PREINIT_ARRAY
++// On ELF platforms, run safestack initialization before any other constructors.
++// On other platforms we use the constructor attribute to arrange to run our
++// initialization early.
++extern "C" {
++__attribute__((section(".preinit_array"),
++               used)) void (*__metastack_preinit)(void) = __metastack_init;
++}
++#endif
++
++extern "C"
++    __attribute__((visibility("default"))) void *__get_tracked_stack_start() {
++  return unsafe_stack_start;
++}
++
++extern "C"
++    __attribute__((visibility("default"))) void *__get_tracked_stack_ptr() {
++  return __metastack_tracked_stack_ptr;
++}
+diff --git a/lib/metalloc/metautils.cc b/lib/metalloc/metautils.cc
+new file mode 100644
+index 0000000..02f2baa
+--- /dev/null
++++ b/lib/metalloc/metautils.cc
+@@ -0,0 +1,9 @@
++#include "sanitizer_common/sanitizer_common.h"
++
++extern "C" SANITIZER_INTERFACE_ATTRIBUTE
++void metalloc_widememset(unsigned long *base, unsigned long size, unsigned long value1, unsigned long value2) {
++    for (unsigned long i = 0; i < size; ++i) {
++        base[2 * i] = value1;
++        base[2 * i + 1] = value2;
++    }
++}
+diff --git a/lib/typesan/CMakeLists.txt b/lib/typesan/CMakeLists.txt
+new file mode 100644
+index 0000000..dbc2a31
+--- /dev/null
++++ b/lib/typesan/CMakeLists.txt
+@@ -0,0 +1,21 @@
++set(TYPESAN_SOURCES
++  typesan.cc
++  )
++
++include_directories(..)
++
++set(TYPESAN_CFLAGS ${SANITIZER_COMMON_CFLAGS})
++
++add_custom_target(typesan)
++
++add_compiler_rt_runtime(clang_rt.typesan
++        STATIC 
++        ARCHS x86_64 
++        SOURCES ${TYPESAN_SOURCES}
++        CFLAGS ${TYPESAN_CFLAGS}
++ 
++        PARENT_TARGET typesan)
++
++add_sanitizer_rt_symbols(clang_rt.typesan)
++
++add_dependencies(compiler-rt typesan)
+diff --git a/lib/typesan/typesan.cc b/lib/typesan/typesan.cc
+new file mode 100644
+index 0000000..66439a3
+--- /dev/null
++++ b/lib/typesan/typesan.cc
+@@ -0,0 +1,380 @@
++#include "ubsan/ubsan_platform.h"
++#include "ubsan/ubsan_handlers_cxx.h"
++#include "ubsan/ubsan_diag.h"
++#include "ubsan/ubsan_type_hash.h" 
++#include "ubsan/ubsan_value.h"
++
++#include "sanitizer_common/sanitizer_report_decorator.h"
++#include "sanitizer_common/sanitizer_common.h"
++#include "sanitizer_common/sanitizer_flags.h"
++#include "sanitizer_common/sanitizer_libc.h"
++
++#include <cxxabi.h>
++#include <stdio.h>
++#include <csignal>
++#include <signal.h>
++#include <ucontext.h>
++#include <vector>
++#include <set>
++#include <unordered_map>
++
++#include "metalloc/metapagetable_core.h"
++
++using namespace __ubsan;
++using namespace std;
++
++#define SAFECAST 0
++#define BADCAST 1
++
++//#define LOG_CAST_COUNT
++#define DO_REPORT_BADCAST
++#define DO_REPORT_BADCAST_FATAL
++#define DO_REPORT_BADCAST_FATAL_NOCOREDUMP
++//#define DO_REPORT_MISSING
++
++#ifdef DO_REPORT_BADCAST_FATAL_NOCOREDUMP
++#define TERMINATE exit(-1);
++#else
++#define TERMINATE abort();
++#endif
++
++#define UNW_LOCAL_ONLY
++#include <cxxabi.h>
++#include <libunwind.h>
++#include <cstdio>
++#include <cstdlib>
++
++static void backtrace() {
++  unw_cursor_t cursor;
++  unw_context_t context;
++
++  // Initialize cursor to current frame for local unwinding.
++  unw_getcontext(&context);
++  unw_init_local(&cursor, &context);
++
++  // Unwind frames one by one, going up the frame stack.
++  while (unw_step(&cursor) > 0) {
++    unw_word_t offset, pc;
++    unw_get_reg(&cursor, UNW_REG_IP, &pc);
++    if (pc == 0) {
++      break;
++    }
++    std::printf("0x%lx:", pc);
++
++    char sym[256];
++    if (unw_get_proc_name(&cursor, sym, sizeof(sym), &offset) == 0) {
++      char* nameptr = sym;
++      int status;
++      char* demangled = abi::__cxa_demangle(sym, nullptr, nullptr, &status);
++      if (status == 0) {
++        nameptr = demangled;
++      }
++      std::printf(" (%s+0x%lx)\n", nameptr, offset);
++      std::free(demangled);
++    } else {
++      std::printf(" -- error: unable to obtain symbol name for this frame\n");
++    }
++  }
++}
++
++
++static FILE *op = nullptr;
++
++static void write_log(string result) {
++        if (op == nullptr) {
++            op = fopen("cast_results.txt", "a");
++        }
++	fprintf(op, "%s\n", result.c_str());
++	fflush(op);
++}
++
++#ifdef LOG_CAST_COUNT
++static volatile unsigned long type1 = 0;
++static volatile unsigned long type2 = 0;
++static volatile unsigned long type3 = 0;
++static volatile unsigned long type4 = 0;
++static volatile unsigned long type5 = 0;
++static volatile unsigned long type6 = 0;
++__attribute__ ((visibility ("default"))) long __typesan_alloc_count; /* enable TRACK_ALLOCATIONS in llvm/lib/Transforms/Utils/HexTypeUtil.cpp */
++
++static void write_log_casts(int signum) {
++    char outputStr[2048];
++    sprintf(outputStr, "%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu",
++        type1, type2, type3, type4, type5, type6, __typesan_alloc_count);
++    write_log(outputStr);
++}
++
++struct LoggerType {
++    LoggerType() {
++        struct sigaction sa = {};
++	sa.sa_handler = write_log_casts;
++        sigaction(50, &sa, NULL);        
++    }
++    ~LoggerType() {
++        write_log_casts(-1);
++    }
++};
++static LoggerType logger;
++#endif
++
++typedef vector<uint64_t> parentHashSetTy;
++// Mapping from class-hash to pointer into parent-hashes set
++// Guaranteed to be fixed in size and the number of hashes is limited to the number of classes
++static unordered_map<uint64_t, parentHashSetTy*> *hashToSetMap;
++
++const static int pageSize = 4096;
++
++extern "C" SANITIZER_INTERFACE_ATTRIBUTE
++void __update_cinfo(unsigned int classCount, unsigned long *infoArray) {
++
++	#ifdef FDEBUG_LOG
++	  char tmp[1000];
++
++	  numUpdate += 1;
++	  numObj += classCount;
++	  sprintf(tmp, "[FDEBUG] %d: Update_cinfo call total number: (%d) total object: (%d)\n", numUpdate, classCount, numObj);
++	  string print(tmp);
++	  write_flog(print);
++	#endif
++
++        // init STL data structures (global initializer interacts poorly with this code)
++        if (hashToSetMap == nullptr) {
++            hashToSetMap = new unordered_map<uint64_t, parentHashSetTy*>(1024);
++        }
++        
++        unsigned int processedCount = 0;
++        unsigned int pos = 0;
++        while(processedCount < classCount) {
++            unsigned long hashCount = infoArray[pos++];
++            uint64_t classHash = infoArray[pos++];
++            // Upmost bit of count signals needs for merger
++            bool doMerge = (hashCount & (1 << 31)) != 0;
++            hashCount &= ~(1 << 31);
++
++            // See if class already has index associated or not
++            auto mapEntry = hashToSetMap->find(classHash);
++            bool alreadyProcessed = false;
++            parentHashSetTy* parentSet;
++            if (mapEntry != hashToSetMap->end()) {
++                alreadyProcessed = true;
++                parentSet = mapEntry->second;
++            } else {
++                parentSet = new parentHashSetTy();
++                hashToSetMap->insert(make_pair(classHash, parentSet));
++            }
++            
++            // No merging requested and class already seen
++            // Skip to next class
++            if (!doMerge && alreadyProcessed) {
++                pos += hashCount - 1;
++                processedCount++;
++                continue;
++            }
++            
++            // Read and insert hashes for the selected class
++            // Class never processed yet, so include all entries
++            if (!alreadyProcessed) {
++                parentSet->reserve(hashCount - 1);
++                for(unsigned int i = 0; i < hashCount - 1; i++) {
++                    parentSet->push_back(infoArray[pos++]);
++                }
++            // Class already processed, but merging requested
++            // Merge new elements uniquely using a set proxy
++            } else {
++                set<uint64_t> hashSet(parentSet->begin(), parentSet->end());
++                for(unsigned int i = 0; i < hashCount - 1; i++) {
++                    uint64_t hash = infoArray[pos++];
++                    auto insertIt = hashSet.insert(hash);
++                    if (insertIt.second) {
++                        parentSet->push_back(hash);
++                    }
++                }
++            }
++            
++            processedCount++;
++        }
++}
++
++__attribute__((always_inline)) inline static void check_cast(uptr* src_addr, uptr* dst_addr, uint64_t dst) {
++#ifdef LOG_CAST_COUNT
++    type1++;
++#endif
++
++        if (src_addr == nullptr)
++            return;
++
++#ifdef LOG_CAST_COUNT
++    type2++;
++#endif 
++
++	uint64_t src = 0;
++
++        unsigned long ptrInt = (unsigned long)src_addr;
++        unsigned long pageIndex = (unsigned long)ptrInt / pageSize;
++        unsigned long pageEntry = pageTable[pageIndex];
++        unsigned long *metaBase = (unsigned long*)(pageEntry >> 8);
++        unsigned long alignment = pageEntry & 0xFF;
++        char *alloc_base = (char*)(metaBase[2 * ((ptrInt & (pageSize - 1)) >> alignment)]);
++        // No metadata for object
++        if (alloc_base == nullptr) {
++#ifdef DO_REPORT_MISSING
++		static int missingc = 0;
++		static int missingt = 1;
++		missingc++;
++		if (missingc >= missingt) {
++			printf("\n\t\t== Missing metadata ==\n");
++			printf("src_addr=%p dst_addr=%p dst=%lu\n", src_addr, dst_addr, (unsigned long) dst);
++			backtrace();
++			missingt *= 2;
++		}
++#endif
++		return;
++	}
++        
++#ifdef LOG_CAST_COUNT
++    type3++;
++#endif
++
++        long offset = (char*)dst_addr - alloc_base;
++        if (offset < 0) {
++#ifdef DO_REPORT_BADCAST
++            printf("\n\t\t== TypeSan Bad-casting Reports ==\n");
++            printf("\t\tDetected type confusion from negative offset (%ld) to %lu\n", offset, (unsigned long) dst);
++            backtrace();
++#endif
++#ifdef DO_REPORT_BADCAST_FATAL
++            TERMINATE
++#endif
++	    return;
++        }
++        unsigned long *typeInfo = (unsigned long*)(metaBase[2 * ((ptrInt & (pageSize - 1)) >> alignment) + 1]);
++        long currentOffset = typeInfo[0];
++        // If first offset is not 0, then we are pointing to size field
++        // This suggests an array allocation and we need to adjust offset to match
++        if (currentOffset != 0) {
++            if (currentOffset == -1) {
++		// special case: no typeinfo at all means blacklisted
++#ifdef LOG_CAST_COUNT
++		type6++;
++#endif
++                return;
++            }
++            offset %= currentOffset;
++            currentOffset = 0;
++            typeInfo++;
++        }
++        while(1) {
++            // Found matching entry
++            if (offset == currentOffset) {
++                src = typeInfo[1];
++                break;
++            // Move to next entry if needed
++            } else if (offset >= (long)(typeInfo[2] & ~((long)1 << 63))) {
++                typeInfo += 2;
++                currentOffset = (long)typeInfo[0];
++                if (currentOffset == -1) {
++                    break;
++                }
++                continue;
++            }
++            // Try to match with current array entry
++            long currentArrayOffset = currentOffset & ~((long)1 << 63);
++            if (currentOffset != currentArrayOffset) {
++                offset -= currentArrayOffset;
++                unsigned long *arrayTypeInfo = (unsigned long*)(typeInfo[1]);
++                offset %= (long)arrayTypeInfo[0];
++                typeInfo = arrayTypeInfo + 1;
++                currentOffset = 0;
++                continue;
++            // No match found
++            } else {
++                break;
++            }
++        }
++        if (src == 0) {
++#ifdef DO_REPORT_BADCAST
++            //SourceLocation Loc = Data->Loc.acquire();
++            printf("\n\t\t== TypeSan Bad-casting Reports ==\n");
++            //printf("\t\tFileName : %s Line: %d Column %d\n", Loc.getFilename(), Loc.getLine(), Loc.getColumn());
++            printf("\t\tDetected type confusion from unknown offset (%ld) in type-info (%p) to %lu\n", (char*)dst_addr - alloc_base, (unsigned long*)(metaBase[2 * ((ptrInt & (pageSize - 1)) >> alignment) + 1]), (unsigned long) dst);
++            backtrace();
++#endif
++#ifdef DO_REPORT_BADCAST_FATAL
++            TERMINATE
++#endif
++	    return;
++        }
++            
++        // Types match perfectly
++        if(src == dst) {
++
++#ifdef LOG_CAST_COUNT
++    type4++;
++#endif
++
++            return;
++        }
++        
++	int result = -1;
++    
++	{
++                auto indexIt = hashToSetMap->find(src);
++                if (indexIt == hashToSetMap->end()) {
++#ifdef DO_REPORT_BADCAST
++                    printf("\n\t\t== TypeSan Bad-casting Reports ==\n");
++                    printf("\t\tDetected type confusion from unknown hash (%lu) to %lu\n", (unsigned long) src, (unsigned long) dst);
++                    backtrace();
++#endif
++#ifdef DO_REPORT_BADCAST_FATAL
++                    TERMINATE
++#endif
++		    return;
++                }
++
++                auto *parentHashSet = indexIt->second;
++                for(uint64_t hash : *parentHashSet) {
++                    if(hash == dst) {
++
++                        result = SAFECAST;
++                        break;
++                    }
++                }
++                if(result != SAFECAST) {
++
++                    result = BADCAST;
++                }
++	}
++
++#ifdef LOG_CAST_COUNT
++        if (result == BADCAST) {
++            type5++;
++        }
++#endif
++
++	if (result == BADCAST) {
++#ifdef DO_REPORT_BADCAST
++		printf("\n\t\t== TypeSan Bad-casting Reports ==\n");
++		printf("\t\tDetected type confusion from %lu to %lu\n", (unsigned long) src, (unsigned long) dst);
++		backtrace();
++#endif
++#ifdef DO_REPORT_BADCAST_FATAL
++		TERMINATE
++#endif
++		return;
++	}
++
++	return;
++}
++
++// Checking bad-casting 
++extern "C" SANITIZER_INTERFACE_ATTRIBUTE
++void __changing_type_casting_verification(uptr* src_addr, uptr* dst_addr, uint64_t dst) {
++    check_cast(src_addr, dst_addr, dst);
++}
++
++// Checking bad-casting 
++extern "C" SANITIZER_INTERFACE_ATTRIBUTE
++void __type_casting_verification(uptr* src_addr, uint64_t dst) {
++    check_cast(src_addr, src_addr, dst);
++}
++
